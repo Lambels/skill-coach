@@ -60,10 +60,10 @@ class InvocationRecord:
 def parse_session_file(path: str | Path) -> Iterator[InvocationRecord]:
     """Yield one InvocationRecord per completed Skill tool_use → tool_result pair.
 
-    Token-usage values are attributed to the *first* Skill tool_use within a
-    given request_id; subsequent Skill tool_uses sharing the same request_id
-    get zero usage. This keeps SUM(tokens) across all rows equal to the real
-    request cost when one request fires multiple skills.
+    Skill invocations whose request_id contains any other tool_use (including
+    another Skill) are *skipped entirely* — the Anthropic API reports usage
+    at request granularity, so we cannot cleanly attribute tokens between the
+    co-located tool_uses. Better to omit than to record an imprecise figure.
     """
     path = Path(path).expanduser()
     raw_lines = _read_lines_with_offsets(path)
@@ -72,9 +72,9 @@ def parse_session_file(path: str | Path) -> Iterator[InvocationRecord]:
     cwd = _first_value(raw_lines, "cwd")
     thinking_chars_by_req = _thinking_chars_by_request(raw_lines)
     usage_by_req = _usage_by_request(raw_lines)
+    tool_count_by_req = _tool_use_counts_by_request(raw_lines)
 
     pending: dict[str, InvocationRecord] = {}
-    claimed_requests: set[str] = set()
 
     for offset, msg in raw_lines:
         mtype = msg.get("type")
@@ -85,6 +85,9 @@ def parse_session_file(path: str | Path) -> Iterator[InvocationRecord]:
             timestamp = msg.get("timestamp")
             content = message.get("content", []) or []
 
+            if tool_count_by_req.get(request_id, 0) > 1:
+                continue
+
             for block in content:
                 if not (block.get("type") == "tool_use" and block.get("name") == "Skill"):
                     continue
@@ -92,8 +95,6 @@ def parse_session_file(path: str | Path) -> Iterator[InvocationRecord]:
                 tuid = block.get("id") or ""
                 inp = block.get("input", {}) or {}
                 args_json = json.dumps(inp, ensure_ascii=False)
-
-                first_claim = request_id and request_id not in claimed_requests
                 usage, model = usage_by_req.get(request_id, ({}, None))
                 cache_creation = usage.get("cache_creation", {}) or {}
                 server_tool_use = usage.get("server_tool_use", {}) or {}
@@ -113,24 +114,22 @@ def parse_session_file(path: str | Path) -> Iterator[InvocationRecord]:
                     duration_ms=0,
                     model=model,
                     service_tier=usage.get("service_tier"),
-                    input_tokens=usage.get("input_tokens", 0) if first_claim else 0,
-                    output_tokens=usage.get("output_tokens", 0) if first_claim else 0,
-                    cache_read_tokens=usage.get("cache_read_input_tokens", 0) if first_claim else 0,
-                    cache_creation_tokens=usage.get("cache_creation_input_tokens", 0) if first_claim else 0,
-                    cache_5m_tokens=cache_creation.get("ephemeral_5m_input_tokens", 0) if first_claim else 0,
-                    cache_1h_tokens=cache_creation.get("ephemeral_1h_input_tokens", 0) if first_claim else 0,
-                    thinking_tokens=(thinking_chars_by_req.get(request_id, 0) // 4) if first_claim else 0,
+                    input_tokens=usage.get("input_tokens", 0),
+                    output_tokens=usage.get("output_tokens", 0),
+                    cache_read_tokens=usage.get("cache_read_input_tokens", 0),
+                    cache_creation_tokens=usage.get("cache_creation_input_tokens", 0),
+                    cache_5m_tokens=cache_creation.get("ephemeral_5m_input_tokens", 0),
+                    cache_1h_tokens=cache_creation.get("ephemeral_1h_input_tokens", 0),
+                    thinking_tokens=thinking_chars_by_req.get(request_id, 0) // 4,
                     result_size_bytes=0,
                     iterations=max(1, len(usage.get("iterations", []) or [])),
-                    web_searches=server_tool_use.get("web_search_requests", 0) if first_claim else 0,
-                    web_fetches=server_tool_use.get("web_fetch_requests", 0) if first_claim else 0,
+                    web_searches=server_tool_use.get("web_search_requests", 0),
+                    web_fetches=server_tool_use.get("web_fetch_requests", 0),
                     success=True,
                     error_message=None,
                     tool_use_line_offset=offset,
                     tool_result_line_offset=None,
                 )
-                if first_claim:
-                    claimed_requests.add(request_id)
                 pending[tuid] = rec
 
         elif mtype == "user":
@@ -198,6 +197,21 @@ def _usage_by_request(lines: list[tuple[int, dict]]) -> dict[str, tuple[dict, Op
         usage = message.get("usage") or {}
         if usage:
             out[req] = (usage, message.get("model"))
+    return out
+
+
+def _tool_use_counts_by_request(lines: list[tuple[int, dict]]) -> dict[str, int]:
+    """Count content-block tool_uses (any tool) per request_id."""
+    out: dict[str, int] = {}
+    for _, msg in lines:
+        if msg.get("type") != "assistant":
+            continue
+        req = msg.get("requestId")
+        if not req:
+            continue
+        for block in (msg.get("message") or {}).get("content") or []:
+            if block.get("type") == "tool_use":
+                out[req] = out.get(req, 0) + 1
     return out
 
 
