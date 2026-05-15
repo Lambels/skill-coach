@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from pathlib import Path
 from typing import Optional
 
 from . import stats
@@ -27,7 +28,6 @@ def overview(conn: sqlite3.Connection, days: Optional[int] = None) -> dict:
             COALESCE(SUM(output_tokens), 0)           AS output_tokens,
             COALESCE(SUM(cache_read_tokens), 0)       AS cache_read_tokens,
             COALESCE(SUM(cache_creation_tokens), 0)   AS cache_creation_tokens,
-            COALESCE(SUM(thinking_tokens), 0)         AS thinking_tokens,
             MIN(started_at)                       AS first_seen,
             MAX(started_at)                       AS last_seen
         FROM skill_invocations
@@ -101,7 +101,6 @@ def skill_detail(
             COALESCE(SUM(output_tokens), 0)           AS total_output,
             COALESCE(SUM(cache_read_tokens), 0)       AS total_cache_read,
             COALESCE(SUM(cache_creation_tokens), 0)   AS total_cache_creation,
-            COALESCE(SUM(thinking_tokens), 0)         AS total_thinking,
             AVG(duration_ms)                      AS avg_duration_ms,
             AVG(result_size_bytes)                AS avg_result_bytes,
             COUNT(DISTINCT session_id)            AS distinct_sessions,
@@ -150,10 +149,11 @@ def skill_invocations(
     rows = conn.execute(
         f"""
         SELECT
-            tool_use_id, session_id, started_at, duration_ms,
+            tool_use_id, session_id, session_file_path, started_at, duration_ms,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
             (input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) AS total_tokens,
-            result_size_bytes, args_preview, success, cwd, model
+            result_size_bytes, success, cwd, model,
+            tool_use_line_offset, tool_result_line_offset
         FROM skill_invocations
         WHERE skill_name = ? {tf_sql}
         ORDER BY started_at DESC
@@ -323,11 +323,13 @@ def top_invocations(
     rows = conn.execute(
         f"""
         SELECT
-            tool_use_id, skill_name, session_id, cwd, started_at, duration_ms,
+            tool_use_id, skill_name, session_id, session_file_path,
+            cwd, started_at, duration_ms,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
             (input_tokens + output_tokens
              + cache_read_tokens + cache_creation_tokens) AS total_tokens,
-            result_size_bytes, args_preview, success, model
+            result_size_bytes, success, model,
+            tool_use_line_offset, tool_result_line_offset
         FROM skill_invocations
         WHERE 1=1 {tf_sql}
         ORDER BY {order_by[by]}
@@ -404,9 +406,8 @@ def _smoke(db_path: str = "/tmp/csm-smoke.db") -> None:
 
         print("\n=== top_invocations(by='tokens', limit=5) ===")
         for r in top_invocations(conn, by="tokens", limit=5):
-            preview = (r['args_preview'] or '')[:50]
             print(f"  {r['skill_name']:<25}  tokens={r['total_tokens']:>10,}"
-                  f"  args={preview!r}")
+                  f"  offset@{r['tool_use_line_offset']}  in {Path(r['session_file_path']).name[:8]}")
 
 
 if __name__ == "__main__":

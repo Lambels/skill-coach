@@ -19,17 +19,13 @@ CREATE TABLE IF NOT EXISTS skill_invocations (
     session_file_path       TEXT NOT NULL,
 
     skill_name              TEXT NOT NULL,
-    args_size_bytes         INTEGER,
-    args_preview            TEXT,
-    caller_type             TEXT,
     cwd                     TEXT,
+    model                   TEXT,
+    service_tier            TEXT,
 
     started_at              INTEGER NOT NULL,
     ended_at                INTEGER NOT NULL,
     duration_ms             INTEGER NOT NULL,
-
-    model                   TEXT,
-    service_tier            TEXT,
 
     input_tokens            INTEGER NOT NULL DEFAULT 0,
     output_tokens           INTEGER NOT NULL DEFAULT 0,
@@ -37,15 +33,10 @@ CREATE TABLE IF NOT EXISTS skill_invocations (
     cache_creation_tokens   INTEGER NOT NULL DEFAULT 0,
     cache_5m_tokens         INTEGER NOT NULL DEFAULT 0,
     cache_1h_tokens         INTEGER NOT NULL DEFAULT 0,
-    thinking_tokens         INTEGER NOT NULL DEFAULT 0,
 
     result_size_bytes       INTEGER NOT NULL DEFAULT 0,
-    iterations              INTEGER NOT NULL DEFAULT 1,
-    web_searches            INTEGER NOT NULL DEFAULT 0,
-    web_fetches             INTEGER NOT NULL DEFAULT 0,
 
     success                 INTEGER NOT NULL,
-    error_message           TEXT,
 
     tool_use_line_offset    INTEGER,
     tool_result_line_offset INTEGER,
@@ -72,23 +63,21 @@ CREATE TABLE IF NOT EXISTS index_cursor (
 INSERT_INVOCATION_SQL = """
 INSERT OR IGNORE INTO skill_invocations (
     request_id, tool_use_id, session_id, session_file_path,
-    skill_name, args_size_bytes, args_preview, caller_type, cwd,
+    skill_name, cwd, model, service_tier,
     started_at, ended_at, duration_ms,
-    model, service_tier,
     input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-    cache_5m_tokens, cache_1h_tokens, thinking_tokens,
-    result_size_bytes, iterations, web_searches, web_fetches,
-    success, error_message,
+    cache_5m_tokens, cache_1h_tokens,
+    result_size_bytes,
+    success,
     tool_use_line_offset, tool_result_line_offset
 ) VALUES (
     ?, ?, ?, ?,
-    ?, ?, ?, ?, ?,
-    ?, ?, ?,
-    ?, ?,
     ?, ?, ?, ?,
     ?, ?, ?,
     ?, ?, ?, ?,
     ?, ?,
+    ?,
+    ?,
     ?, ?
 )
 """
@@ -183,13 +172,12 @@ def all_cursor_paths(conn: sqlite3.Connection) -> set[str]:
 def _record_to_tuple(r: InvocationRecord) -> tuple:
     return (
         r.request_id, r.tool_use_id, r.session_id, r.session_file_path,
-        r.skill_name, r.args_size_bytes, r.args_preview, r.caller_type, r.cwd,
+        r.skill_name, r.cwd, r.model, r.service_tier,
         r.started_at, r.ended_at, r.duration_ms,
-        r.model, r.service_tier,
         r.input_tokens, r.output_tokens, r.cache_read_tokens, r.cache_creation_tokens,
-        r.cache_5m_tokens, r.cache_1h_tokens, r.thinking_tokens,
-        r.result_size_bytes, r.iterations, r.web_searches, r.web_fetches,
-        int(r.success), r.error_message,
+        r.cache_5m_tokens, r.cache_1h_tokens,
+        r.result_size_bytes,
+        int(r.success),
         r.tool_use_line_offset, r.tool_result_line_offset,
     )
 

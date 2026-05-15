@@ -1,9 +1,15 @@
-"""Parse a Claude Code session JSONL file into per-Skill-invocation records."""
+"""Parse a Claude Code session JSONL file into per-Skill-invocation records.
+
+Records contain only the data the index DB needs: numeric metrics + identifiers
++ byte-offset pointers back into the JSONL. Text content (args, errors, prompt
+text, thinking, tool result bodies) is NOT extracted here — consumers that need
+content read it on demand from the JSONL using the offsets.
+"""
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Optional
@@ -17,21 +23,16 @@ class InvocationRecord:
     session_id: str
     session_file_path: str
 
-    # the call
+    # categorical identifiers
     skill_name: str
-    args_size_bytes: int
-    args_preview: str
-    caller_type: str
     cwd: Optional[str]
+    model: Optional[str]
+    service_tier: Optional[str]
 
     # timing (epoch ms)
     started_at: int
     ended_at: int
     duration_ms: int
-
-    # model
-    model: Optional[str]
-    service_tier: Optional[str]
 
     # tokens
     input_tokens: int
@@ -40,17 +41,12 @@ class InvocationRecord:
     cache_creation_tokens: int
     cache_5m_tokens: int
     cache_1h_tokens: int
-    thinking_tokens: int
 
-    # shape / side effects
+    # shape
     result_size_bytes: int
-    iterations: int
-    web_searches: int
-    web_fetches: int
 
     # outcome
     success: bool
-    error_message: Optional[str]
 
     # JSONL pointers
     tool_use_line_offset: int
@@ -63,14 +59,13 @@ def parse_session_file(path: str | Path) -> Iterator[InvocationRecord]:
     Skill invocations whose request_id contains any other tool_use (including
     another Skill) are *skipped entirely* — the Anthropic API reports usage
     at request granularity, so we cannot cleanly attribute tokens between the
-    co-located tool_uses. Better to omit than to record an imprecise figure.
+    co-located tool_uses.
     """
     path = Path(path).expanduser()
     raw_lines = _read_lines_with_offsets(path)
 
     session_id = _first_value(raw_lines, "sessionId") or path.stem
     cwd = _first_value(raw_lines, "cwd")
-    thinking_chars_by_req = _thinking_chars_by_request(raw_lines)
     usage_by_req = _usage_by_request(raw_lines)
     tool_count_by_req = _tool_use_counts_by_request(raw_lines)
 
@@ -94,10 +89,8 @@ def parse_session_file(path: str | Path) -> Iterator[InvocationRecord]:
 
                 tuid = block.get("id") or ""
                 inp = block.get("input", {}) or {}
-                args_json = json.dumps(inp, ensure_ascii=False)
                 usage, model = usage_by_req.get(request_id, ({}, None))
                 cache_creation = usage.get("cache_creation", {}) or {}
-                server_tool_use = usage.get("server_tool_use", {}) or {}
 
                 rec = InvocationRecord(
                     request_id=request_id,
@@ -105,28 +98,20 @@ def parse_session_file(path: str | Path) -> Iterator[InvocationRecord]:
                     session_id=session_id,
                     session_file_path=str(path),
                     skill_name=inp.get("skill", "") or "",
-                    args_size_bytes=len(args_json.encode("utf-8")),
-                    args_preview=args_json[:200],
-                    caller_type=(block.get("caller") or {}).get("type", "direct"),
                     cwd=cwd,
+                    model=model,
+                    service_tier=usage.get("service_tier"),
                     started_at=_iso_to_ms(timestamp),
                     ended_at=0,
                     duration_ms=0,
-                    model=model,
-                    service_tier=usage.get("service_tier"),
                     input_tokens=usage.get("input_tokens", 0),
                     output_tokens=usage.get("output_tokens", 0),
                     cache_read_tokens=usage.get("cache_read_input_tokens", 0),
                     cache_creation_tokens=usage.get("cache_creation_input_tokens", 0),
                     cache_5m_tokens=cache_creation.get("ephemeral_5m_input_tokens", 0),
                     cache_1h_tokens=cache_creation.get("ephemeral_1h_input_tokens", 0),
-                    thinking_tokens=thinking_chars_by_req.get(request_id, 0) // 4,
                     result_size_bytes=0,
-                    iterations=max(1, len(usage.get("iterations", []) or [])),
-                    web_searches=server_tool_use.get("web_search_requests", 0),
-                    web_fetches=server_tool_use.get("web_fetch_requests", 0),
                     success=True,
-                    error_message=None,
                     tool_use_line_offset=offset,
                     tool_result_line_offset=None,
                 )
@@ -214,22 +199,6 @@ def _tool_use_counts_by_request(lines: list[tuple[int, dict]]) -> dict[str, int]
         for block in (msg.get("message") or {}).get("content") or []:
             if block.get("type") == "tool_use":
                 out[req] = out.get(req, 0) + 1
-    return out
-
-
-def _thinking_chars_by_request(lines: list[tuple[int, dict]]) -> dict[str, int]:
-    out: dict[str, int] = {}
-    for _, msg in lines:
-        if msg.get("type") != "assistant":
-            continue
-        req = msg.get("requestId")
-        if not req:
-            continue
-        for block in (msg.get("message") or {}).get("content") or []:
-            if block.get("type") == "thinking":
-                text = block.get("thinking", "")
-                if isinstance(text, str):
-                    out[req] = out.get(req, 0) + len(text)
     return out
 
 
