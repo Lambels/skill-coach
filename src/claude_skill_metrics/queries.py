@@ -7,9 +7,10 @@ or a list of dicts (multi row). No formatting, no JSON, no cost math.
 from __future__ import annotations
 
 import sqlite3
-import statistics
 import time
 from typing import Optional
+
+from . import stats
 
 
 def overview(conn: sqlite3.Connection, days: Optional[int] = None) -> dict:
@@ -126,10 +127,8 @@ def skill_detail(
         params,
     ).fetchall()
 
-    durations = [r["duration_ms"] for r in rows]
-    results = [r["result_size_bytes"] for r in rows]
-    dp = _percentiles(durations, [50, 95])
-    rp = _percentiles(results, [50, 95])
+    dp = stats.percentiles([r["duration_ms"] for r in rows], [50, 95])
+    rp = stats.percentiles([r["result_size_bytes"] for r in rows], [50, 95])
 
     out = dict(agg)
     out["skill_name"] = name
@@ -344,15 +343,6 @@ def _time_filter(days: Optional[int]) -> tuple[str, tuple]:
         return "", ()
     cutoff_ms = int((time.time() - days * 86400) * 1000)
     return "AND started_at >= ?", (cutoff_ms,)
-
-
-def _percentiles(values: list, percentiles: list[int]) -> dict[int, float]:
-    if not values:
-        return {p: 0.0 for p in percentiles}
-    if len(values) == 1:
-        return {p: float(values[0]) for p in percentiles}
-    qs = statistics.quantiles(sorted(values), n=100, method="inclusive")
-    return {p: qs[p - 1] for p in percentiles}
 
 
 def _smoke(db_path: str = "/tmp/csm-smoke.db") -> None:
