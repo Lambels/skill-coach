@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-skill-metrics"
+version = "0.1.0"
+description = "Index and analyse Claude Code skill usage from local session logs."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [{ name = "Patrick Arvatu" }]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+claude-skill-stats = "claude_skill_metrics.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
