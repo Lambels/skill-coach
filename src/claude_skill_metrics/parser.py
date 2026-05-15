@@ -154,10 +154,12 @@ def parse_session_file(path: str | Path) -> Iterator[InvocationRecord]:
                     rec.success = bool(tur["success"])
                 yield rec
 
-    for rec in pending.values():
-        rec.success = False
-        rec.error_message = "orphan: no tool_result before end of file"
-        yield rec
+    # Pending records (tool_use without its tool_result) are deliberately NOT yielded.
+    # They represent in-flight Skill calls in live sessions, or crash artefacts.
+    # If indexed now with placeholder values, INSERT OR IGNORE would lock the row
+    # in with bad data — the next sweep would see the same (request_id, tool_use_id)
+    # and silently skip the corrected record. Better to index them on the sweep
+    # AFTER their tool_result lands.
 
 
 def _read_lines_with_offsets(path: Path) -> list[tuple[int, dict]]:
