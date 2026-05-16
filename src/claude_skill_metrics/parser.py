@@ -1,40 +1,56 @@
-"""Parse a Claude Code session JSONL file into per-Skill-invocation records.
+"""Parse Claude Code session JSONL files into per-skill-invocation span records.
 
-Records contain only the data the index DB needs: numeric metrics + identifiers
-+ byte-offset pointers back into the JSONL. Text content (args, errors, prompt
-text, thinking, tool result bodies) is NOT extracted here — consumers that need
-content read it on demand from the JSONL using the offsets.
+Two invocation types share one measurement algorithm:
+
+  TYPE 1 — skill_tool   : model emits tool_use(Skill, X), then a banner
+                          tool_result, then Claude Code injects the skill's
+                          SKILL.md as a `isMeta=true` user line.
+  TYPE 2 — slash_command: user types /X. The tag line is followed by Claude
+                          Code's `isMeta=true` user line carrying the SKILL.md.
+
+Both types' SPAN starts at the meta line and runs until the next trigger of
+either kind OR the next fresh user prompt OR EOF. Tokens are summed across
+all assistant requests in the span, dedup'd by request_id.
+
+Records store only numbers + pointers; text content stays in the JSONL.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Optional
 
 
+_SLASH_TAG_RE = re.compile(r"<command-name>/([^<\s]+)</command-name>")
+
+
 @dataclass
 class InvocationRecord:
-    # identity
-    request_id: str
-    tool_use_id: str
+    invocation_type: str            # 'skill_tool' | 'slash_command'
+
+    # pointers / identity
     session_id: str
     session_file_path: str
+    start_line_offset: int          # meta line (where SKILL.md begins)
+    end_line_offset: Optional[int]  # last assistant line in span
+    trigger_line_offset: int        # tool_use line OR slash tag line
 
-    # categorical identifiers
+    # context
     skill_name: str
     cwd: Optional[str]
     model: Optional[str]
     service_tier: Optional[str]
 
     # timing (epoch ms)
-    started_at: int
-    ended_at: int
+    started_at: int                 # meta line timestamp
+    ended_at: int                   # last span line timestamp
     duration_ms: int
 
-    # tokens
+    # tokens (SUM across span, dedup'd by request_id)
     input_tokens: int
     output_tokens: int
     cache_read_tokens: int
@@ -42,109 +58,295 @@ class InvocationRecord:
     cache_5m_tokens: int
     cache_1h_tokens: int
 
-    # shape
-    result_size_bytes: int
+    # span shape
+    n_requests: int
+    first_request_id: Optional[str]
 
     # outcome
     success: bool
 
-    # JSONL pointers
-    tool_use_line_offset: int
-    tool_result_line_offset: Optional[int]
+
+# ────────────────────────────── public API ──────────────────────────────
 
 
 def parse_session_file(path: str | Path) -> Iterator[InvocationRecord]:
-    """Yield one InvocationRecord per completed Skill tool_use → tool_result pair.
-
-    Skill invocations whose request_id contains any other tool_use (including
-    another Skill) are *skipped entirely* — the Anthropic API reports usage
-    at request granularity, so we cannot cleanly attribute tokens between the
-    co-located tool_uses.
-    """
+    """Yield one InvocationRecord per completed skill-invocation span."""
     path = Path(path).expanduser()
     raw_lines = _read_lines_with_offsets(path)
 
     session_id = _first_value(raw_lines, "sessionId") or path.stem
     cwd = _first_value(raw_lines, "cwd")
-    usage_by_req = _usage_by_request(raw_lines)
-    tool_count_by_req = _tool_use_counts_by_request(raw_lines)
 
-    pending: dict[str, InvocationRecord] = {}
+    triggers = _find_triggers(raw_lines)
+    invocations = _pair_with_meta(raw_lines, triggers)
 
-    for offset, msg in raw_lines:
+    for inv in invocations:
+        rec = _measure_span(raw_lines, inv, invocations, session_id, cwd, path)
+        if rec is not None:
+            yield rec
+
+
+# ────────────────────────────── pass 1: find triggers ──────────────────────────────
+
+
+def _find_triggers(raw_lines: list[tuple[int, dict]]) -> list[dict]:
+    """Locate every Skill tool_use AND every slash tag in order."""
+    out: list[dict] = []
+    for i, (offset, msg) in enumerate(raw_lines):
         mtype = msg.get("type")
+        if mtype == "user":
+            c = (msg.get("message") or {}).get("content")
+            if isinstance(c, str):
+                m = _SLASH_TAG_RE.search(c)
+                if m:
+                    out.append({
+                        "idx": i, "offset": offset,
+                        "type": "slash_command",
+                        "skill_name": m.group(1),
+                        "tool_use_id": None,
+                        "timestamp": msg.get("timestamp"),
+                    })
+        elif mtype == "assistant":
+            for b in (msg.get("message") or {}).get("content") or []:
+                if b.get("type") == "tool_use" and b.get("name") == "Skill":
+                    inp = b.get("input") or {}
+                    out.append({
+                        "idx": i, "offset": offset,
+                        "type": "skill_tool",
+                        "skill_name": inp.get("skill", "") or "",
+                        "tool_use_id": b.get("id"),
+                        "timestamp": msg.get("timestamp"),
+                    })
+                    break  # one Skill per assistant message in observed data
+    return out
 
-        if mtype == "assistant":
-            message = msg.get("message", {}) or {}
-            request_id = msg.get("requestId") or ""
-            timestamp = msg.get("timestamp")
-            content = message.get("content", []) or []
 
-            if tool_count_by_req.get(request_id, 0) > 1:
+# ────────────────────────────── pass 2: pair triggers with meta lines ──────────────────────────────
+
+
+def _pair_with_meta(
+    raw_lines: list[tuple[int, dict]], triggers: list[dict]
+) -> list[dict]:
+    """For each trigger, find its isMeta=true user line. Triggers without a
+    meta line are skipped (built-ins like /clear, or errored tool dispatches).
+    Failed tool dispatches (with <tool_use_error>) yield a record with success=False
+    and no measurable span."""
+    invocations: list[dict] = []
+    for t in triggers:
+        meta_idx, meta_offset, meta_ts, errored = _find_meta_for(raw_lines, t)
+        if meta_idx is not None:
+            invocations.append({
+                **t,
+                "meta_idx": meta_idx,
+                "meta_offset": meta_offset,
+                "meta_ts": meta_ts,
+                "failed": False,
+            })
+        elif errored:
+            invocations.append({
+                **t,
+                "meta_idx": None,
+                "meta_offset": None,
+                "meta_ts": None,
+                "failed": True,
+            })
+        # else: no meta and not errored → built-in slash like /clear, /compact — skip
+    return invocations
+
+
+def _find_meta_for(
+    raw_lines: list[tuple[int, dict]], trigger: dict
+) -> tuple[Optional[int], Optional[int], Optional[str], bool]:
+    """Returns (meta_idx, meta_offset, meta_ts, errored). meta_* is None if no
+    meta was found within reasonable distance. errored=True means we found a
+    <tool_use_error> tool_result before the meta line (failed dispatch)."""
+    for j in range(trigger["idx"] + 1, len(raw_lines)):
+        joffset, jmsg = raw_lines[j]
+        jtype = jmsg.get("type")
+
+        # Skip lines that can appear between a trigger and its meta.
+        if jtype in ("attachment", "file-history-snapshot", "system", "last-prompt"):
+            continue
+
+        if jtype != "user":
+            # An assistant line before meta means the meta was never injected.
+            return (None, None, None, False)
+
+        jc = (jmsg.get("message") or {}).get("content")
+
+        # For skill_tool, the tool_result line sits between the tool_use and the meta.
+        if trigger["type"] == "skill_tool" and isinstance(jc, list):
+            tool_result_block = next(
+                (b for b in jc if isinstance(b, dict)
+                 and b.get("type") == "tool_result"
+                 and b.get("tool_use_id") == trigger["tool_use_id"]),
+                None,
+            )
+            if tool_result_block is not None:
+                content = tool_result_block.get("content") or ""
+                if isinstance(content, str) and "<tool_use_error>" in content:
+                    return (None, None, None, True)
+                # OK tool_result — keep walking
                 continue
 
-            for block in content:
-                if not (block.get("type") == "tool_use" and block.get("name") == "Skill"):
-                    continue
+        # The meta line: isMeta=true user line (content is a list of text blocks)
+        if jmsg.get("isMeta") is True:
+            return (j, joffset, jmsg.get("timestamp"), False)
 
-                tuid = block.get("id") or ""
-                inp = block.get("input", {}) or {}
-                usage, model = usage_by_req.get(request_id, ({}, None))
-                cache_creation = usage.get("cache_creation", {}) or {}
+        # Any other user line breaks the trigger→meta sequence
+        return (None, None, None, False)
 
-                rec = InvocationRecord(
-                    request_id=request_id,
-                    tool_use_id=tuid,
-                    session_id=session_id,
-                    session_file_path=str(path),
-                    skill_name=inp.get("skill", "") or "",
-                    cwd=cwd,
-                    model=model,
-                    service_tier=usage.get("service_tier"),
-                    started_at=_iso_to_ms(timestamp),
-                    ended_at=0,
-                    duration_ms=0,
-                    input_tokens=usage.get("input_tokens", 0),
-                    output_tokens=usage.get("output_tokens", 0),
-                    cache_read_tokens=usage.get("cache_read_input_tokens", 0),
-                    cache_creation_tokens=usage.get("cache_creation_input_tokens", 0),
-                    cache_5m_tokens=cache_creation.get("ephemeral_5m_input_tokens", 0),
-                    cache_1h_tokens=cache_creation.get("ephemeral_1h_input_tokens", 0),
-                    result_size_bytes=0,
-                    success=True,
-                    tool_use_line_offset=offset,
-                    tool_result_line_offset=None,
-                )
-                pending[tuid] = rec
+    return (None, None, None, False)
 
-        elif mtype == "user":
-            message = msg.get("message", {}) or {}
-            content = message.get("content")
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if block.get("type") != "tool_result":
-                    continue
-                tuid = block.get("tool_use_id")
-                if tuid not in pending:
-                    continue
-                rec = pending.pop(tuid)
-                rec.result_size_bytes = _measure_result_size(block.get("content"))
-                rec.tool_result_line_offset = offset
-                rec.ended_at = _iso_to_ms(msg.get("timestamp"))
-                if rec.ended_at and rec.started_at:
-                    rec.duration_ms = max(0, rec.ended_at - rec.started_at)
-                tur = msg.get("toolUseResult")
-                if isinstance(tur, dict) and "success" in tur:
-                    rec.success = bool(tur["success"])
-                yield rec
 
-    # Pending records (tool_use without its tool_result) are deliberately NOT yielded.
-    # They represent in-flight Skill calls in live sessions, or crash artefacts.
-    # If indexed now with placeholder values, INSERT OR IGNORE would lock the row
-    # in with bad data — the next sweep would see the same (request_id, tool_use_id)
-    # and silently skip the corrected record. Better to index them on the sweep
-    # AFTER their tool_result lands.
+# ────────────────────────────── pass 3: measure each span ──────────────────────────────
+
+
+def _measure_span(
+    raw_lines: list[tuple[int, dict]],
+    inv: dict,
+    all_invocations: list[dict],
+    session_id: str,
+    cwd: Optional[str],
+    path: Path,
+) -> Optional[InvocationRecord]:
+    """Walk the span (meta_idx, span_end) and sum dedup'd token usage."""
+    if inv["failed"]:
+        ts_ms = _iso_to_ms(inv["timestamp"])
+        return InvocationRecord(
+            invocation_type=inv["type"],
+            session_id=session_id,
+            session_file_path=str(path),
+            start_line_offset=inv["offset"],     # no meta — use trigger offset
+            end_line_offset=None,
+            trigger_line_offset=inv["offset"],
+            skill_name=inv["skill_name"],
+            cwd=cwd,
+            model=None,
+            service_tier=None,
+            started_at=ts_ms,
+            ended_at=ts_ms,
+            duration_ms=0,
+            input_tokens=0,
+            output_tokens=0,
+            cache_read_tokens=0,
+            cache_creation_tokens=0,
+            cache_5m_tokens=0,
+            cache_1h_tokens=0,
+            n_requests=0,
+            first_request_id=None,
+            success=False,
+        )
+
+    meta_idx = inv["meta_idx"]
+
+    # Span ends at min(next trigger after meta, next fresh user prompt after meta, EOF).
+    next_trigger_idx = min(
+        (o["idx"] for o in all_invocations if o["idx"] > meta_idx),
+        default=len(raw_lines),
+    )
+    next_fresh_idx = len(raw_lines)
+    for j in range(meta_idx + 1, len(raw_lines)):
+        if _is_fresh_user_prompt(raw_lines[j][1]):
+            next_fresh_idx = j
+            break
+
+    span_end_idx = min(next_trigger_idx, next_fresh_idx)
+
+    # In-flight at EOF (no boundary found) → orphan, skip.
+    if span_end_idx == len(raw_lines):
+        return None
+
+    # Walk assistant lines in (meta_idx, span_end_idx); dedup by request_id.
+    seen_reqs: set[str] = set()
+    sum_in = sum_out = sum_cr = sum_cc = sum_5m = sum_1h = 0
+    n_requests = 0
+    first_req: Optional[str] = None
+    model: Optional[str] = None
+    service_tier: Optional[str] = None
+    last_offset: Optional[int] = inv["meta_offset"]
+    last_ts: Optional[str] = inv["meta_ts"]
+
+    for j in range(meta_idx + 1, span_end_idx):
+        joffset, jmsg = raw_lines[j]
+        if jmsg.get("type") != "assistant":
+            continue
+        req = jmsg.get("requestId") or ""
+        last_offset = joffset
+        last_ts = jmsg.get("timestamp") or last_ts
+        if not req or req in seen_reqs:
+            continue
+        seen_reqs.add(req)
+        n_requests += 1
+        if first_req is None:
+            first_req = req
+        message = jmsg.get("message") or {}
+        if model is None:
+            model = message.get("model")
+        usage = message.get("usage") or {}
+        if usage and service_tier is None:
+            service_tier = usage.get("service_tier")
+        sum_in += usage.get("input_tokens", 0) or 0
+        sum_out += usage.get("output_tokens", 0) or 0
+        sum_cr += usage.get("cache_read_input_tokens", 0) or 0
+        sum_cc += usage.get("cache_creation_input_tokens", 0) or 0
+        cc = usage.get("cache_creation") or {}
+        sum_5m += cc.get("ephemeral_5m_input_tokens", 0) or 0
+        sum_1h += cc.get("ephemeral_1h_input_tokens", 0) or 0
+
+    started_at = _iso_to_ms(inv["meta_ts"])
+    ended_at = _iso_to_ms(last_ts) if last_ts else started_at
+    duration_ms = max(0, ended_at - started_at) if ended_at and started_at else 0
+
+    return InvocationRecord(
+        invocation_type=inv["type"],
+        session_id=session_id,
+        session_file_path=str(path),
+        start_line_offset=inv["meta_offset"],
+        end_line_offset=last_offset if n_requests > 0 else None,
+        trigger_line_offset=inv["offset"],
+        skill_name=inv["skill_name"],
+        cwd=cwd,
+        model=model,
+        service_tier=service_tier,
+        started_at=started_at,
+        ended_at=ended_at,
+        duration_ms=duration_ms,
+        input_tokens=sum_in,
+        output_tokens=sum_out,
+        cache_read_tokens=sum_cr,
+        cache_creation_tokens=sum_cc,
+        cache_5m_tokens=sum_5m,
+        cache_1h_tokens=sum_1h,
+        n_requests=n_requests,
+        first_request_id=first_req,
+        success=True,
+    )
+
+
+def _is_fresh_user_prompt(msg: dict) -> bool:
+    """A user-typed prompt that ENDS a span. Excludes:
+       - meta lines (isMeta=true)
+       - tool_result lines (list content with type=tool_result)
+       - slash command tag lines (string content with <command-name>) — those
+         are themselves triggers and ALREADY end the span via next-trigger logic.
+    """
+    if msg.get("type") != "user":
+        return False
+    if msg.get("isMeta") is True:
+        return False
+    c = (msg.get("message") or {}).get("content")
+    if isinstance(c, str):
+        return "<command-name>" not in c
+    if isinstance(c, list):
+        return not any(
+            isinstance(b, dict) and b.get("type") == "tool_result"
+            for b in c
+        )
+    return False
+
+
+# ────────────────────────────── stdlib helpers ──────────────────────────────
 
 
 def _read_lines_with_offsets(path: Path) -> list[tuple[int, dict]]:
@@ -171,57 +373,6 @@ def _first_value(lines: list[tuple[int, dict]], key: str) -> Optional[str]:
     return None
 
 
-def _usage_by_request(lines: list[tuple[int, dict]]) -> dict[str, tuple[dict, Optional[str]]]:
-    """First non-empty usage block per request_id, plus the model that produced it."""
-    out: dict[str, tuple[dict, Optional[str]]] = {}
-    for _, msg in lines:
-        if msg.get("type") != "assistant":
-            continue
-        req = msg.get("requestId")
-        if not req or req in out:
-            continue
-        message = msg.get("message") or {}
-        usage = message.get("usage") or {}
-        if usage:
-            out[req] = (usage, message.get("model"))
-    return out
-
-
-def _tool_use_counts_by_request(lines: list[tuple[int, dict]]) -> dict[str, int]:
-    """Count content-block tool_uses (any tool) per request_id."""
-    out: dict[str, int] = {}
-    for _, msg in lines:
-        if msg.get("type") != "assistant":
-            continue
-        req = msg.get("requestId")
-        if not req:
-            continue
-        for block in (msg.get("message") or {}).get("content") or []:
-            if block.get("type") == "tool_use":
-                out[req] = out.get(req, 0) + 1
-    return out
-
-
-def _measure_result_size(content) -> int:
-    if content is None:
-        return 0
-    if isinstance(content, str):
-        return len(content.encode("utf-8"))
-    if isinstance(content, list):
-        total = 0
-        for b in content:
-            if isinstance(b, dict):
-                t = b.get("text") or b.get("content") or ""
-                if isinstance(t, str):
-                    total += len(t.encode("utf-8"))
-                else:
-                    total += len(json.dumps(t, ensure_ascii=False).encode("utf-8"))
-            elif isinstance(b, str):
-                total += len(b.encode("utf-8"))
-        return total
-    return len(json.dumps(content, ensure_ascii=False).encode("utf-8"))
-
-
 def _iso_to_ms(s: Optional[str]) -> int:
     if not s:
         return 0
@@ -232,6 +383,9 @@ def _iso_to_ms(s: Optional[str]) -> int:
         return 0
 
 
+# ────────────────────────────── smoke ──────────────────────────────
+
+
 def _smoke(path: str) -> None:
     import sys
 
@@ -239,23 +393,25 @@ def _smoke(path: str) -> None:
     if not p.exists():
         print(f"file not found: {p}", file=sys.stderr)
         sys.exit(1)
+
     count = 0
+    total_all = 0
+    print(f"{'#':>3}  {'type':<14} {'skill':<22} {'reqs':>4} {'in':>5} {'out':>6}"
+          f" {'cache_r':>9} {'cache_c':>7} {'TOTAL':>10}  {'dur':>7}  ok")
+    print("─" * 110)
     for rec in parse_session_file(p):
         count += 1
-        total = (
-            rec.input_tokens
-            + rec.output_tokens
-            + rec.cache_read_tokens
-            + rec.cache_creation_tokens
-        )
+        total = rec.input_tokens + rec.output_tokens + rec.cache_read_tokens + rec.cache_creation_tokens
+        total_all += total
+        dur = f"{rec.duration_ms}ms" if rec.duration_ms < 1000 else f"{rec.duration_ms/1000:.1f}s"
         print(
-            f"#{count:>3}  {rec.skill_name:<25}  "
-            f"in={rec.input_tokens:>6}  out={rec.output_tokens:>5}  "
-            f"cache_r={rec.cache_read_tokens:>6}  cache_c={rec.cache_creation_tokens:>5}  "
-            f"total={total:>7}  result_b={rec.result_size_bytes:>6}  "
-            f"dur_ms={rec.duration_ms:>5}  ok={rec.success}"
+            f"{count:>3}  {rec.invocation_type:<14} {rec.skill_name:<22}"
+            f" {rec.n_requests:>4} {rec.input_tokens:>5} {rec.output_tokens:>6}"
+            f" {rec.cache_read_tokens:>9,} {rec.cache_creation_tokens:>7,}"
+            f" {total:>10,}  {dur:>7}  {'✓' if rec.success else '✗'}"
         )
-    print(f"\n{count} record(s)")
+    print("─" * 110)
+    print(f"{count} record(s)   total tokens: {total_all:,}")
 
 
 if __name__ == "__main__":
