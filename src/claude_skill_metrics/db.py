@@ -12,7 +12,6 @@ from .parser import InvocationRecord
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS skill_invocations (
-    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     request_id              TEXT NOT NULL,
     tool_use_id             TEXT NOT NULL,
     session_id              TEXT NOT NULL,
@@ -41,8 +40,8 @@ CREATE TABLE IF NOT EXISTS skill_invocations (
     tool_use_line_offset    INTEGER,
     tool_result_line_offset INTEGER,
 
-    UNIQUE(request_id, tool_use_id)
-);
+    PRIMARY KEY (request_id, tool_use_id)
+) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS idx_skill   ON skill_invocations(skill_name);
 CREATE INDEX IF NOT EXISTS idx_time    ON skill_invocations(started_at);
