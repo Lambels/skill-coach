@@ -7,25 +7,33 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
+
+from rich import box
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
 
 from . import db, pricing, queries
 from .indexer import DEFAULT_DB_PATH, DEFAULT_PROJECTS_DIR, SweepResult, index_sweep
 
 
-# ────────────────────────────── formatters ──────────────────────────────
+_stdout = Console()
+_stderr = Console(stderr=True)
+
+
+# ────────────────────────────── value formatters ──────────────────────────────
 
 
 def fmt_int(n) -> str:
-    if n is None:
-        return ""
-    return f"{int(n):,}"
+    return f"{int(n):,}" if n is not None else ""
 
 
-def fmt_float(n, places: int = 2) -> str:
+def fmt_int_or_blank(n) -> str:
     if n is None:
         return ""
-    return f"{float(n):,.{places}f}"
+    n = int(n)
+    return f"{n:,}" if n else ""
 
 
 def fmt_cost(c) -> str:
@@ -45,7 +53,7 @@ def fmt_bytes(n) -> str:
     n = float(n)
     if n < 1024:
         return f"{int(n)}B"
-    if n < 1024 * 1024:
+    if n < 1024**2:
         return f"{n / 1024:.1f}K"
     if n < 1024**3:
         return f"{n / 1024**2:.1f}M"
@@ -71,15 +79,11 @@ def fmt_ts(epoch_ms) -> str:
 
 
 def fmt_ratio(r) -> str:
-    if r is None:
-        return ""
-    return f"{float(r):.3f}"
+    return f"{float(r):.3f}" if r is not None else ""
 
 
 def fmt_short(s, n: int = 8) -> str:
-    if not s:
-        return ""
-    return s[:n]
+    return s[:n] if s else ""
 
 
 def fmt_path_tail(s, n: int = 30) -> str:
@@ -88,19 +92,33 @@ def fmt_path_tail(s, n: int = 30) -> str:
     return s if len(s) <= n else "…" + s[-(n - 1):]
 
 
-def fmt_table(rows: list[dict], columns: list[tuple]) -> str:
-    """Render rows as a fixed-width table.
+def fmt_success(b) -> str:
+    if b is None:
+        return ""
+    return "[green]✓[/green]" if b else "[red]✗[/red]"
 
-    columns: list of (key, header, formatter_or_None, alignment) tuples.
-    alignment: 'l' for left, 'r' for right.
-    """
+
+# ────────────────────────────── table builder ──────────────────────────────
+
+
+def render_table(
+    title: Optional[str],
+    rows: Iterable[dict],
+    columns: list[tuple],
+) -> Table:
+    """columns: (key, header, formatter_or_None, justify, style)."""
+    table = Table(title=title, box=box.ROUNDED, header_style="bold cyan", title_style="bold")
+    for _, header, _, justify, style in columns:
+        table.add_column(header, justify=justify, style=style or None, no_wrap=True)
+
+    rows = list(rows)
     if not rows:
-        return "  (no rows)\n"
+        # rich shows empty table cleanly; nothing to do
+        return table
 
-    cell_rows: list[list[str]] = []
     for r in rows:
         cells = []
-        for key, _, fmt, _ in columns:
+        for key, _, fmt, _, _ in columns:
             v = r.get(key)
             if fmt is not None:
                 cells.append(fmt(v))
@@ -108,52 +126,30 @@ def fmt_table(rows: list[dict], columns: list[tuple]) -> str:
                 cells.append("")
             else:
                 cells.append(str(v))
-        cell_rows.append(cells)
-
-    headers = [c[1] for c in columns]
-    aligns = [c[3] for c in columns]
-    widths = [len(h) for h in headers]
-    for cells in cell_rows:
-        for i, c in enumerate(cells):
-            if len(c) > widths[i]:
-                widths[i] = len(c)
-
-    def render(cells: list[str]) -> str:
-        parts = []
-        for i, c in enumerate(cells):
-            if aligns[i] == "r":
-                parts.append(f"{c:>{widths[i]}}")
-            else:
-                parts.append(f"{c:<{widths[i]}}")
-        return "  ".join(parts)
-
-    out = [render(headers), render(["─" * w for w in widths])]
-    for cells in cell_rows:
-        out.append(render(cells))
-    return "\n".join(out) + "\n"
+        table.add_row(*cells)
+    return table
 
 
 # ────────────────────────────── sweep banner ──────────────────────────────
 
 
 def print_sweep_banner(r: SweepResult, quiet: bool) -> None:
-    """Tell the user what the sweep did. Silent if nothing changed (or --quiet)."""
     if quiet:
         return
     if r.files_indexed == 0 and r.files_pruned == 0 and not r.errors:
         return
     bits = []
     if r.files_indexed:
-        bits.append(f"indexed {r.files_indexed}")
+        bits.append(f"[cyan]indexed[/cyan] {r.files_indexed}")
     if r.files_pruned:
-        bits.append(f"pruned {r.files_pruned}")
+        bits.append(f"[yellow]pruned[/yellow] {r.files_pruned}")
     if r.rows_added:
-        bits.append(f"{r.rows_added} new rows")
+        bits.append(f"[green]+{r.rows_added} rows[/green]")
     if r.errors:
-        bits.append(f"{len(r.errors)} errors")
-    print(f"(sweep: {', '.join(bits)} in {r.duration_ms}ms)", file=sys.stderr)
+        bits.append(f"[red]{len(r.errors)} errors[/red]")
+    _stderr.print(f"[dim](sweep:[/dim] {' [dim]·[/dim] '.join(bits)} [dim]· {r.duration_ms}ms)[/dim]")
     for path, msg in r.errors[:5]:
-        print(f"  ! {path}: {msg}", file=sys.stderr)
+        _stderr.print(f"  [red]![/red] [dim]{path}[/dim]: {msg}")
 
 
 # ────────────────────────────── command handlers ──────────────────────────────
@@ -162,7 +158,7 @@ def print_sweep_banner(r: SweepResult, quiet: bool) -> None:
 def cmd_overview(args, conn) -> None:
     ov = queries.overview(conn, days=args.days)
     if not ov.get("invocations"):
-        print("No invocations indexed yet.")
+        _stdout.print("[yellow]No invocations indexed yet.[/yellow]")
         return
 
     if args.json:
@@ -170,42 +166,44 @@ def cmd_overview(args, conn) -> None:
         return
 
     window = f"last {args.days} days" if args.days else "all time"
-    print(f"Window:      {window}")
-    print(f"             {fmt_ts(ov['first_seen'])} → {fmt_ts(ov['last_seen'])}")
-    print(f"Invocations: {ov['invocations']:,}")
-    print(f"Skills:      {ov['distinct_skills']}")
-    print(f"Sessions:    {ov['distinct_sessions']}")
-    print(f"Projects:    {ov['distinct_projects']}")
-    print()
-    print("Tokens:")
-    print(f"  input              {ov['input_tokens']:>14,}")
-    print(f"  output             {ov['output_tokens']:>14,}")
-    print(f"  cache_read         {ov['cache_read_tokens']:>14,}")
-    print(f"  cache_creation     {ov['cache_creation_tokens']:>14,}")
-    print()
 
-    print("Top skills by total tokens:")
+    header_lines = [
+        f"[bold]Window:[/bold]      {window}",
+        f"             [dim]{fmt_ts(ov['first_seen'])} → {fmt_ts(ov['last_seen'])}[/dim]",
+        f"[bold]Invocations:[/bold] {ov['invocations']:,}",
+        f"[bold]Skills:[/bold]      {ov['distinct_skills']}",
+        f"[bold]Sessions:[/bold]    {ov['distinct_sessions']}",
+        f"[bold]Projects:[/bold]    {ov['distinct_projects']}",
+        "",
+        "[bold]Tokens[/bold]",
+        f"  input              [yellow]{ov['input_tokens']:>14,}[/yellow]",
+        f"  output             [yellow]{ov['output_tokens']:>14,}[/yellow]",
+        f"  cache_read         [yellow]{ov['cache_read_tokens']:>14,}[/yellow]",
+        f"  cache_creation     [yellow]{ov['cache_creation_tokens']:>14,}[/yellow]",
+    ]
+    _stdout.print(Panel("\n".join(header_lines), box=box.ROUNDED, padding=(0, 2)))
+
     top = queries.top_skills(conn, by="tokens", limit=10, days=args.days)
-    print(fmt_table(
+    _stdout.print(render_table(
+        "Top skills by total tokens",
         top,
         [
-            ("skill_name",      "skill",   None,                            "l"),
-            ("calls",           "calls",   fmt_int,                         "r"),
-            ("total_tokens",    "tokens",  fmt_int,                         "r"),
-            ("avg_tokens",      "avg",     lambda n: fmt_int(int(n)) if n else "",  "r"),
-            ("avg_duration_ms", "ms",      lambda n: fmt_duration_ms(n) if n else "",  "r"),
+            ("skill_name",      "skill",  None,             "left",  "cyan"),
+            ("calls",           "calls",  fmt_int,          "right", None),
+            ("total_tokens",    "tokens", fmt_int,          "right", "yellow"),
+            ("avg_tokens",      "avg",    lambda n: fmt_int(int(n)) if n else "", "right", None),
+            ("avg_duration_ms", "ms",     lambda n: fmt_duration_ms(n) if n else "", "right", "dim"),
         ],
     ))
 
-    # Spend ranking using pricing
-    print("Top skills by USD cost:")
-    cost_rows = _cost_per_skill(conn, days=args.days)
-    print(fmt_table(
-        cost_rows[:10],
+    cost_rows = _cost_per_skill(conn, days=args.days)[:10]
+    _stdout.print(render_table(
+        "Top skills by USD cost",
+        cost_rows,
         [
-            ("skill_name", "skill", None,    "l"),
-            ("calls",      "calls", fmt_int, "r"),
-            ("cost_usd",   "cost",  fmt_cost,"r"),
+            ("skill_name", "skill", None,    "left",  "cyan"),
+            ("calls",      "calls", fmt_int, "right", None),
+            ("cost_usd",   "cost",  fmt_cost,"right", "green"),
         ],
     ))
 
@@ -213,7 +211,7 @@ def cmd_overview(args, conn) -> None:
 def cmd_skill(args, conn) -> None:
     d = queries.skill_detail(conn, args.name, days=args.days)
     if d is None:
-        print(f"No data for skill {args.name!r} in window.")
+        _stderr.print(f"[red]No data for skill[/red] [cyan]{args.name}[/cyan] [red]in window.[/red]")
         sys.exit(1)
 
     if args.json:
@@ -221,40 +219,44 @@ def cmd_skill(args, conn) -> None:
         return
 
     total_tokens = d["total_input"] + d["total_output"] + d["total_cache_read"] + d["total_cache_creation"]
-    print(f"Skill:               {d['skill_name']}")
-    print(f"Window:              {'last ' + str(args.days) + ' days' if args.days else 'all time'}")
-    print(f"  {fmt_ts(d['first_seen'])} → {fmt_ts(d['last_seen'])}")
-    print(f"Calls:               {d['calls']:,}")
-    print(f"Success rate:        {d['success_rate']:.1%}")
-    print(f"Distinct sessions:   {d['distinct_sessions']}")
-    print(f"Distinct projects:   {d['distinct_projects']}")
-    print()
-    print("Tokens:")
-    print(f"  input              {d['total_input']:>14,}")
-    print(f"  output             {d['total_output']:>14,}")
-    print(f"  cache_read         {d['total_cache_read']:>14,}")
-    print(f"  cache_creation     {d['total_cache_creation']:>14,}")
-    print(f"  total              {total_tokens:>14,}")
-    print()
-    print("Latency / shape:")
-    print(f"  duration  avg = {fmt_duration_ms(d['avg_duration_ms'])}"
-          f"   p50 = {fmt_duration_ms(d['p50_duration_ms'])}"
-          f"   p95 = {fmt_duration_ms(d['p95_duration_ms'])}")
-    print(f"  result    avg = {fmt_bytes(d['avg_result_bytes'])}"
-          f"   p50 = {fmt_bytes(d['p50_result_bytes'])}"
-          f"   p95 = {fmt_bytes(d['p95_result_bytes'])}")
-    print()
-    print("Recent invocations:")
+
+    header = [
+        f"[bold cyan]{d['skill_name']}[/bold cyan]",
+        f"[dim]{'last ' + str(args.days) + ' days' if args.days else 'all time'} · {fmt_ts(d['first_seen'])} → {fmt_ts(d['last_seen'])}[/dim]",
+        "",
+        f"[bold]Calls:[/bold]              {d['calls']:,}",
+        f"[bold]Success rate:[/bold]       {d['success_rate']:.1%}",
+        f"[bold]Distinct sessions:[/bold]  {d['distinct_sessions']}",
+        f"[bold]Distinct projects:[/bold]  {d['distinct_projects']}",
+        "",
+        "[bold]Tokens[/bold]",
+        f"  input              [yellow]{d['total_input']:>14,}[/yellow]",
+        f"  output             [yellow]{d['total_output']:>14,}[/yellow]",
+        f"  cache_read         [yellow]{d['total_cache_read']:>14,}[/yellow]",
+        f"  cache_creation     [yellow]{d['total_cache_creation']:>14,}[/yellow]",
+        f"  [bold]total[/bold]              [bold yellow]{total_tokens:>14,}[/bold yellow]",
+        "",
+        "[bold]Latency / shape[/bold]",
+        f"  duration  avg = {fmt_duration_ms(d['avg_duration_ms'])}"
+        f"   p50 = {fmt_duration_ms(d['p50_duration_ms'])}"
+        f"   p95 = {fmt_duration_ms(d['p95_duration_ms'])}",
+        f"  result    avg = {fmt_bytes(d['avg_result_bytes'])}"
+        f"   p50 = {fmt_bytes(d['p50_result_bytes'])}"
+        f"   p95 = {fmt_bytes(d['p95_result_bytes'])}",
+    ]
+    _stdout.print(Panel("\n".join(header), box=box.ROUNDED, padding=(0, 2)))
+
     invs = queries.skill_invocations(conn, args.name, limit=args.limit, days=args.days)
-    print(fmt_table(
+    _stdout.print(render_table(
+        "Recent invocations",
         invs,
         [
-            ("started_at",        "when",     fmt_ts,            "l"),
-            ("duration_ms",       "dur",      fmt_duration_ms,   "r"),
-            ("total_tokens",      "tokens",   fmt_int,           "r"),
-            ("result_size_bytes", "result",   fmt_bytes,          "r"),
-            ("session_id",        "session",  lambda s: fmt_short(s, 8),  "l"),
-            ("success",           "ok",       lambda b: "✓" if b else "✗",  "l"),
+            ("started_at",        "when",    fmt_ts,            "left",  None),
+            ("duration_ms",       "dur",     fmt_duration_ms,   "right", "dim"),
+            ("total_tokens",      "tokens",  fmt_int,           "right", "yellow"),
+            ("result_size_bytes", "result",  fmt_bytes,         "right", None),
+            ("session_id",        "session", lambda s: fmt_short(s, 8), "left", "dim"),
+            ("success",           "ok",      fmt_success,       "center", None),
         ],
     ))
 
@@ -264,15 +266,17 @@ def cmd_trend(args, conn) -> None:
     if args.json:
         print(json.dumps(rows, indent=2, default=str))
         return
-    print(fmt_table(
+    title = f"Daily trend ({args.days} days{', ' + args.skill if args.skill else ''})"
+    _stdout.print(render_table(
+        title,
         rows,
         [
-            ("day",                   "day",       None,    "l"),
-            ("calls",                 "calls",     fmt_int, "r"),
-            ("input_tokens",          "input",     fmt_int, "r"),
-            ("output_tokens",         "output",    fmt_int, "r"),
-            ("cache_read_tokens",     "cache_r",   fmt_int, "r"),
-            ("cache_creation_tokens", "cache_c",   fmt_int, "r"),
+            ("day",                   "day",      None,     "left",  None),
+            ("calls",                 "calls",    fmt_int,  "right", None),
+            ("input_tokens",          "input",    fmt_int,  "right", "dim"),
+            ("output_tokens",         "output",   fmt_int,  "right", None),
+            ("cache_read_tokens",     "cache_r",  fmt_int,  "right", "yellow"),
+            ("cache_creation_tokens", "cache_c",  fmt_int,  "right", "yellow"),
         ],
     ))
 
@@ -282,15 +286,16 @@ def cmd_sessions(args, conn) -> None:
     if args.json:
         print(json.dumps(rows, indent=2, default=str))
         return
-    print(fmt_table(
+    _stdout.print(render_table(
+        "Most expensive sessions",
         rows,
         [
-            ("session_id",      "session",  lambda s: fmt_short(s, 8),  "l"),
-            ("started_at",      "when",     fmt_ts,            "l"),
-            ("cwd",             "project",  lambda s: fmt_path_tail(s, 30),  "l"),
-            ("calls",           "calls",    fmt_int,           "r"),
-            ("distinct_skills", "skills",   fmt_int,           "r"),
-            ("total_tokens",    "tokens",   fmt_int,           "r"),
+            ("session_id",      "session", lambda s: fmt_short(s, 8), "left",  "dim"),
+            ("started_at",      "when",    fmt_ts,            "left",  None),
+            ("cwd",             "project", lambda s: fmt_path_tail(s, 30), "left", "dim"),
+            ("calls",           "calls",   fmt_int,           "right", None),
+            ("distinct_skills", "skills",  fmt_int,           "right", "cyan"),
+            ("total_tokens",    "tokens",  fmt_int,           "right", "yellow"),
         ],
     ))
 
@@ -302,13 +307,14 @@ def cmd_project(args, conn) -> None:
     if args.json:
         print(json.dumps(rows, indent=2, default=str))
         return
-    print(fmt_table(
+    _stdout.print(render_table(
+        "Per-project breakdown",
         rows,
         [
-            ("cwd",          "project",   lambda s: fmt_path_tail(s, 35),  "l"),
-            ("skill_name",   "skill",     None,    "l"),
-            ("calls",        "calls",     fmt_int, "r"),
-            ("total_tokens", "tokens",    fmt_int, "r"),
+            ("cwd",          "project", lambda s: fmt_path_tail(s, 35), "left",  "dim"),
+            ("skill_name",   "skill",   None,    "left",  "cyan"),
+            ("calls",        "calls",   fmt_int, "right", None),
+            ("total_tokens", "tokens",  fmt_int, "right", "yellow"),
         ],
     ))
 
@@ -320,17 +326,23 @@ def cmd_top(args, conn) -> None:
     if args.json:
         print(json.dumps(rows, indent=2, default=str))
         return
-    print(fmt_table(
+    # Show the column that matched the sort prominently, drop the others to keep table tight.
+    extra_cols = {
+        "tokens":      [],
+        "duration":    [("duration_ms", "dur", fmt_duration_ms, "right", "dim")],
+        "result_size": [("result_size_bytes", "result", fmt_bytes, "right", None)],
+        "output":      [("output_tokens", "output", fmt_int, "right", None)],
+    }[args.by]
+    _stdout.print(render_table(
+        f"Top {args.limit} invocations by {args.by}",
         rows,
         [
-            ("skill_name",        "skill",   None,             "l"),
-            ("started_at",        "when",    fmt_ts,           "l"),
-            ("total_tokens",      "tokens",  fmt_int,          "r"),
-            ("output_tokens",     "out",     fmt_int,          "r"),
-            ("duration_ms",       "dur",     fmt_duration_ms,  "r"),
-            ("result_size_bytes", "result",  fmt_bytes,         "r"),
-            ("cost_usd",          "cost",    fmt_cost,         "r"),
-            ("session_id",        "session", lambda s: fmt_short(s, 8), "l"),
+            ("skill_name",   "skill",   None,                       "left",   "cyan"),
+            ("started_at",   "when",    fmt_ts,                     "left",   None),
+            ("total_tokens", "tokens",  fmt_int,                    "right",  "yellow"),
+            *extra_cols,
+            ("cost_usd",     "cost",    fmt_cost,                   "right",  "green"),
+            ("session_id",   "session", lambda s: fmt_short(s, 8),  "left",   "dim"),
         ],
     ))
 
@@ -340,15 +352,27 @@ def cmd_cache(args, conn) -> None:
     if args.json:
         print(json.dumps(rows, indent=2, default=str))
         return
-    print(fmt_table(
+
+    def hit_ratio_cell(r):
+        if r is None:
+            return ""
+        v = float(r)
+        if v < 0.5:
+            return f"[red]{v:.3f}[/red]"
+        if v < 0.8:
+            return f"[yellow]{v:.3f}[/yellow]"
+        return f"[green]{v:.3f}[/green]"
+
+    _stdout.print(render_table(
+        "Cache health (worst first)",
         rows,
         [
-            ("skill_name",            "skill",       None,    "l"),
-            ("calls",                 "calls",       fmt_int, "r"),
-            ("cache_hit_ratio",       "hit_ratio",   fmt_ratio,"r"),
-            ("avg_uncached_input",    "avg_in",      lambda n: fmt_int(int(n)) if n else "",  "r"),
-            ("avg_cache_read",        "avg_cache_r", lambda n: fmt_int(int(n)) if n else "",  "r"),
-            ("avg_cache_creation",    "avg_cache_c", lambda n: fmt_int(int(n)) if n else "",  "r"),
+            ("skill_name",         "skill",       None,            "left",  "cyan"),
+            ("calls",              "calls",       fmt_int,         "right", None),
+            ("cache_hit_ratio",    "hit_ratio",   hit_ratio_cell,  "right", None),
+            ("avg_uncached_input", "avg_in",      lambda n: fmt_int(int(n)) if n else "", "right", "dim"),
+            ("avg_cache_read",     "avg_cache_r", lambda n: fmt_int(int(n)) if n else "", "right", None),
+            ("avg_cache_creation", "avg_cache_c", lambda n: fmt_int(int(n)) if n else "", "right", None),
         ],
     ))
 
@@ -358,20 +382,20 @@ def cmd_models(args, conn) -> None:
     if args.json:
         print(json.dumps(rows, indent=2, default=str))
         return
-    print(fmt_table(
+    _stdout.print(render_table(
+        "Per-model rollup",
         rows,
         [
-            ("model",           "model",   None,    "l"),
-            ("calls",           "calls",   fmt_int, "r"),
-            ("distinct_skills", "skills",  fmt_int, "r"),
-            ("total_tokens",    "tokens",  fmt_int, "r"),
-            ("avg_tokens",      "avg",     lambda n: fmt_int(int(n)) if n else "",  "r"),
+            ("model",           "model",   None,    "left",  "cyan"),
+            ("calls",           "calls",   fmt_int, "right", None),
+            ("distinct_skills", "skills",  fmt_int, "right", None),
+            ("total_tokens",    "tokens",  fmt_int, "right", "yellow"),
+            ("avg_tokens",      "avg",     lambda n: fmt_int(int(n)) if n else "", "right", None),
         ],
     ))
 
 
 def cmd_reindex(args, conn=None) -> None:
-    # reindex doesn't use the connection; sweep manages its own.
     r = index_sweep(args.db_path, args.projects_dir)
     if args.json:
         out = {
@@ -385,27 +409,26 @@ def cmd_reindex(args, conn=None) -> None:
         }
         print(json.dumps(out, indent=2))
         return
-    print(f"files_seen    : {r.files_seen}")
-    print(f"files_skipped : {r.files_skipped}")
-    print(f"files_indexed : {r.files_indexed}")
-    print(f"files_pruned  : {r.files_pruned}")
-    print(f"rows_added    : {r.rows_added}")
-    print(f"duration_ms   : {r.duration_ms}")
+
+    lines = [
+        f"[bold]files_seen[/bold]    : {r.files_seen}",
+        f"[bold]files_skipped[/bold] : {r.files_skipped}",
+        f"[bold]files_indexed[/bold] : [cyan]{r.files_indexed}[/cyan]",
+        f"[bold]files_pruned[/bold]  : [yellow]{r.files_pruned}[/yellow]",
+        f"[bold]rows_added[/bold]    : [green]{r.rows_added}[/green]",
+        f"[bold]duration_ms[/bold]   : {r.duration_ms}",
+    ]
     if r.errors:
-        print(f"errors        : {len(r.errors)}")
+        lines.append(f"[bold]errors[/bold]        : [red]{len(r.errors)}[/red]")
         for path, msg in r.errors[:10]:
-            print(f"  ! {path}: {msg}")
+            lines.append(f"  [red]![/red] [dim]{path}[/dim]: {msg}")
+    _stdout.print(Panel("\n".join(lines), title="Sweep result", box=box.ROUNDED, padding=(0, 2)))
 
 
 # ────────────────────────────── helpers ──────────────────────────────
 
 
 def _cost_per_skill(conn, days: Optional[int]) -> list[dict]:
-    """Aggregate USD cost per skill by walking individual rows.
-
-    Required because pricing is model-dependent and the aggregate query
-    SUMs across models — we need raw rows to apply the right rate.
-    """
     tf_sql, tf_params = queries._time_filter(days)
     rows = conn.execute(
         f"""
@@ -416,7 +439,6 @@ def _cost_per_skill(conn, days: Optional[int]) -> list[dict]:
         """,
         tf_params,
     ).fetchall()
-
     totals: dict[str, dict] = {}
     for row in rows:
         d = dict(row)
@@ -435,10 +457,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="claude-skill-stats",
         description="Inspect token usage of Claude Code skills, from local session logs.",
     )
-    p.add_argument("--db-path", default=DEFAULT_DB_PATH,
-                   help=f"SQLite DB path (default: {DEFAULT_DB_PATH})")
-    p.add_argument("--projects-dir", default=DEFAULT_PROJECTS_DIR,
-                   help=f"Claude Code projects dir (default: {DEFAULT_PROJECTS_DIR})")
+    p.add_argument("--db-path", default=DEFAULT_DB_PATH)
+    p.add_argument("--projects-dir", default=DEFAULT_PROJECTS_DIR)
     p.add_argument("--no-sweep", action="store_true",
                    help="skip the index sweep before running the command")
     p.add_argument("--quiet", action="store_true",
@@ -449,18 +469,18 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True, metavar="<command>")
 
     s = sub.add_parser("overview", help="totals + top skills + USD cost")
-    s.add_argument("--days", type=int, default=None, help="window in days")
+    s.add_argument("--days", type=int, default=None)
     s.set_defaults(func=cmd_overview)
 
     s = sub.add_parser("skill", help="detailed stats for one skill")
-    s.add_argument("name", help="skill name (e.g. vault-find-related)")
+    s.add_argument("name")
     s.add_argument("--days", type=int, default=None)
-    s.add_argument("--limit", type=int, default=20, help="recent invocations to show")
+    s.add_argument("--limit", type=int, default=20)
     s.set_defaults(func=cmd_skill)
 
     s = sub.add_parser("trend", help="daily token-spend trend")
     s.add_argument("--days", type=int, default=30)
-    s.add_argument("--skill", default=None, help="filter to one skill")
+    s.add_argument("--skill", default=None)
     s.set_defaults(func=cmd_trend)
 
     s = sub.add_parser("sessions", help="most expensive sessions")
@@ -469,7 +489,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_sessions)
 
     s = sub.add_parser("project", help="per-project breakdown")
-    s.add_argument("cwd", nargs="?", default=None, help="optional cwd filter")
+    s.add_argument("cwd", nargs="?", default=None)
     s.add_argument("--days", type=int, default=None)
     s.set_defaults(func=cmd_project)
 
@@ -499,12 +519,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # Run the sweep first (lazy trigger). reindex re-runs it itself; suppress here.
     if not args.no_sweep and args.command != "reindex":
         r = index_sweep(args.db_path, args.projects_dir)
         print_sweep_banner(r, args.quiet)
 
-    # reindex doesn't need a query connection
     if args.command == "reindex":
         cmd_reindex(args)
         return 0
