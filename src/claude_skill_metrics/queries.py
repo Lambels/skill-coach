@@ -45,13 +45,13 @@ def top_skills(
     days: Optional[int] = None,
     min_calls: int = 1,
 ) -> list[dict]:
-    """Ranked aggregate per skill. `by` ∈ {calls, tokens, avg_tokens, duration, result_size}."""
+    """Ranked aggregate per skill. `by` ∈ {calls, tokens, avg_tokens, duration, output}."""
     order_by = {
         "calls":       "calls DESC",
         "tokens":      "total_tokens DESC",
         "avg_tokens":  "avg_tokens DESC",
         "duration":    "avg_duration_ms DESC",
-        "result_size": "avg_result_bytes DESC",
+        "output":      "total_output DESC",
     }
     if by not in order_by:
         raise ValueError(f"invalid by={by!r}; expected one of {list(order_by)}")
@@ -67,7 +67,7 @@ def top_skills(
             AVG(input_tokens + output_tokens
                 + cache_read_tokens + cache_creation_tokens)                    AS avg_tokens,
             AVG(duration_ms)                                                    AS avg_duration_ms,
-            AVG(result_size_bytes)                                              AS avg_result_bytes,
+            AVG(n_requests)                                                     AS avg_requests,
             SUM(output_tokens)                                                  AS total_output,
             SUM(cache_read_tokens)                                              AS total_cache_read,
             SUM(cache_creation_tokens)                                          AS total_cache_creation,
@@ -102,10 +102,13 @@ def skill_detail(
             COALESCE(SUM(cache_read_tokens), 0)       AS total_cache_read,
             COALESCE(SUM(cache_creation_tokens), 0)   AS total_cache_creation,
             AVG(duration_ms)                      AS avg_duration_ms,
-            AVG(result_size_bytes)                AS avg_result_bytes,
+            AVG(n_requests)                       AS avg_requests,
+            SUM(n_requests)                       AS total_requests,
             COUNT(DISTINCT session_id)            AS distinct_sessions,
             COUNT(DISTINCT cwd)                   AS distinct_projects,
             COALESCE(SUM(success) * 1.0 / NULLIF(COUNT(*), 0), 0) AS success_rate,
+            SUM(CASE WHEN invocation_type = 'slash_command' THEN 1 ELSE 0 END) AS slash_calls,
+            SUM(CASE WHEN invocation_type = 'skill_tool'    THEN 1 ELSE 0 END) AS tool_calls,
             MIN(started_at)                       AS first_seen,
             MAX(started_at)                       AS last_seen
         FROM skill_invocations
@@ -119,7 +122,7 @@ def skill_detail(
 
     rows = conn.execute(
         f"""
-        SELECT duration_ms, result_size_bytes
+        SELECT duration_ms, n_requests
         FROM skill_invocations
         WHERE skill_name = ? {tf_sql}
         """,
@@ -127,14 +130,14 @@ def skill_detail(
     ).fetchall()
 
     dp = stats.percentiles([r["duration_ms"] for r in rows], [50, 95])
-    rp = stats.percentiles([r["result_size_bytes"] for r in rows], [50, 95])
+    rp = stats.percentiles([r["n_requests"] for r in rows], [50, 95])
 
     out = dict(agg)
     out["skill_name"] = name
     out["p50_duration_ms"] = dp[50]
     out["p95_duration_ms"] = dp[95]
-    out["p50_result_bytes"] = rp[50]
-    out["p95_result_bytes"] = rp[95]
+    out["p50_requests"] = rp[50]
+    out["p95_requests"] = rp[95]
     return out
 
 
@@ -149,11 +152,12 @@ def skill_invocations(
     rows = conn.execute(
         f"""
         SELECT
-            tool_use_id, session_id, session_file_path, started_at, duration_ms,
+            invocation_type, first_request_id, session_id, session_file_path,
+            started_at, duration_ms, n_requests,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
             (input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) AS total_tokens,
-            result_size_bytes, success, cwd, model,
-            tool_use_line_offset, tool_result_line_offset
+            success, cwd, model,
+            trigger_line_offset, start_line_offset, end_line_offset
         FROM skill_invocations
         WHERE skill_name = ? {tf_sql}
         ORDER BY started_at DESC
@@ -309,12 +313,12 @@ def top_invocations(
     limit: int = 20,
     days: Optional[int] = None,
 ) -> list[dict]:
-    """Single-call outliers (no aggregation). `by` ∈ {tokens, duration, result_size, output}."""
+    """Single-call outliers (no aggregation). `by` ∈ {tokens, duration, output, requests}."""
     order_by = {
-        "tokens":      "(input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) DESC",
-        "duration":    "duration_ms DESC",
-        "result_size": "result_size_bytes DESC",
-        "output":      "output_tokens DESC",
+        "tokens":   "(input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) DESC",
+        "duration": "duration_ms DESC",
+        "output":   "output_tokens DESC",
+        "requests": "n_requests DESC",
     }
     if by not in order_by:
         raise ValueError(f"invalid by={by!r}; expected one of {list(order_by)}")
@@ -323,13 +327,13 @@ def top_invocations(
     rows = conn.execute(
         f"""
         SELECT
-            tool_use_id, skill_name, session_id, session_file_path,
-            cwd, started_at, duration_ms,
+            invocation_type, first_request_id, skill_name, session_id, session_file_path,
+            cwd, started_at, duration_ms, n_requests,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
             (input_tokens + output_tokens
              + cache_read_tokens + cache_creation_tokens) AS total_tokens,
-            result_size_bytes, success, model,
-            tool_use_line_offset, tool_result_line_offset
+            success, model,
+            trigger_line_offset, start_line_offset, end_line_offset
         FROM skill_invocations
         WHERE 1=1 {tf_sql}
         ORDER BY {order_by[by]}
@@ -406,8 +410,9 @@ def _smoke(db_path: str = "/tmp/csm-smoke.db") -> None:
 
         print("\n=== top_invocations(by='tokens', limit=5) ===")
         for r in top_invocations(conn, by="tokens", limit=5):
-            print(f"  {r['skill_name']:<25}  tokens={r['total_tokens']:>10,}"
-                  f"  offset@{r['tool_use_line_offset']}  in {Path(r['session_file_path']).name[:8]}")
+            print(f"  {r['invocation_type']:<14} {r['skill_name']:<25}"
+                  f"  tokens={r['total_tokens']:>10,}"
+                  f"  trigger@{r['trigger_line_offset']}  in {Path(r['session_file_path']).name[:8]}")
 
 
 if __name__ == "__main__":
