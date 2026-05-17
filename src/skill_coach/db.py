@@ -231,7 +231,7 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("usage: python -m claude_skill_metrics.db <session.jsonl> [db_path]", file=sys.stderr)
+        print("usage: python -m skill_coach.db <session.jsonl> [db_path]", file=sys.stderr)
         sys.exit(2)
     db_path = sys.argv[2] if len(sys.argv) >= 3 else "/tmp/csm-smoke.db"
     _smoke(sys.argv[1], db_path)

@@ -404,6 +404,6 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("usage: python -m claude_skill_metrics.parser <session.jsonl>", file=sys.stderr)
+        print("usage: python -m skill_coach.parser <session.jsonl>", file=sys.stderr)
         sys.exit(2)
     _smoke(sys.argv[1])

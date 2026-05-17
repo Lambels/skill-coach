@@ -15,7 +15,7 @@ from .render import print_sections_as_json, print_sweep_banner, render_sections,
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="claude-skill-stats",
+        prog="skill-coach",
         description="Inspect token usage of Claude Code skills, from local session logs.",
     )
     p.add_argument("--db-path", default=DEFAULT_DB_PATH)
