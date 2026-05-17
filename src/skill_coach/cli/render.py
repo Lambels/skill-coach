@@ -79,20 +79,30 @@ class ColumnFilterError(ValueError):
 
 
 def list_available_columns(sections: list[Section]) -> None:
-    """Print the available columns per table section, marking defaults."""
+    """Print the available columns per table section, marking defaults.
+
+    Mirrors _filter_one_section's rule: if default_columns is None, every
+    column is shown by default. Only when default_columns is an explicit
+    list does the section have opt-in (non-default) columns.
+    """
     any_printed = False
     for s in sections:
         if s.kind != "table" or not s.columns:
             continue
         any_printed = True
-        defaults = set(s.default_columns or [])
+        defaults = set(s.default_columns) if s.default_columns is not None else None
         stdout.print(f"[bold]{s.title}[/bold]")
         for key, header, _, _, _ in s.columns:
-            in_default = (header in defaults) or (key in defaults)
+            if defaults is None:
+                in_default = True
+            else:
+                in_default = (header in defaults) or (key in defaults)
             marker = "[green]●[/green]" if in_default else "[dim]○[/dim]"
             stdout.print(f"  {marker} [cyan]{header}[/cyan]  [dim](key: {key})[/dim]")
-        if defaults:
+        if defaults is not None:
             stdout.print(f"  [dim]● = shown by default, ○ = opt-in via --add[/dim]")
+        else:
+            stdout.print(f"  [dim]all columns shown by default; use --drop to hide some[/dim]")
     if not any_printed:
         stderr.print("[yellow]This command produces no table sections.[/yellow]")
 
