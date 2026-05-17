@@ -12,11 +12,14 @@ from .parser import InvocationRecord
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS skill_invocations (
-    request_id              TEXT NOT NULL,
-    tool_use_id             TEXT NOT NULL,
-    session_id              TEXT NOT NULL,
-    session_file_path       TEXT NOT NULL,
+    invocation_type         TEXT NOT NULL,
 
+    session_file_path       TEXT NOT NULL,
+    start_line_offset       INTEGER NOT NULL,
+    end_line_offset         INTEGER,
+    trigger_line_offset     INTEGER NOT NULL,
+
+    session_id              TEXT NOT NULL,
     skill_name              TEXT NOT NULL,
     cwd                     TEXT,
     model                   TEXT,
@@ -33,20 +36,19 @@ CREATE TABLE IF NOT EXISTS skill_invocations (
     cache_5m_tokens         INTEGER NOT NULL DEFAULT 0,
     cache_1h_tokens         INTEGER NOT NULL DEFAULT 0,
 
-    result_size_bytes       INTEGER NOT NULL DEFAULT 0,
+    n_requests              INTEGER NOT NULL DEFAULT 1,
+    first_request_id        TEXT,
 
-    success                 INTEGER NOT NULL,
+    success                 INTEGER NOT NULL DEFAULT 1,
 
-    tool_use_line_offset    INTEGER,
-    tool_result_line_offset INTEGER,
-
-    PRIMARY KEY (request_id, tool_use_id)
+    PRIMARY KEY (session_file_path, start_line_offset)
 ) WITHOUT ROWID;
 
-CREATE INDEX IF NOT EXISTS idx_skill   ON skill_invocations(skill_name);
-CREATE INDEX IF NOT EXISTS idx_time    ON skill_invocations(started_at);
-CREATE INDEX IF NOT EXISTS idx_session ON skill_invocations(session_id);
-CREATE INDEX IF NOT EXISTS idx_cwd     ON skill_invocations(cwd);
+CREATE INDEX IF NOT EXISTS idx_skill ON skill_invocations(skill_name);
+CREATE INDEX IF NOT EXISTS idx_time  ON skill_invocations(started_at);
+CREATE INDEX IF NOT EXISTS idx_sess  ON skill_invocations(session_id);
+CREATE INDEX IF NOT EXISTS idx_cwd   ON skill_invocations(cwd);
+CREATE INDEX IF NOT EXISTS idx_type  ON skill_invocations(invocation_type);
 
 CREATE TABLE IF NOT EXISTS index_cursor (
     session_file_path   TEXT PRIMARY KEY,
@@ -61,23 +63,23 @@ CREATE TABLE IF NOT EXISTS index_cursor (
 
 INSERT_INVOCATION_SQL = """
 INSERT OR IGNORE INTO skill_invocations (
-    request_id, tool_use_id, session_id, session_file_path,
-    skill_name, cwd, model, service_tier,
+    invocation_type,
+    session_file_path, start_line_offset, end_line_offset, trigger_line_offset,
+    session_id, skill_name, cwd, model, service_tier,
     started_at, ended_at, duration_ms,
     input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
     cache_5m_tokens, cache_1h_tokens,
-    result_size_bytes,
-    success,
-    tool_use_line_offset, tool_result_line_offset
+    n_requests, first_request_id,
+    success
 ) VALUES (
+    ?,
     ?, ?, ?, ?,
-    ?, ?, ?, ?,
+    ?, ?, ?, ?, ?,
     ?, ?, ?,
     ?, ?, ?, ?,
     ?, ?,
-    ?,
-    ?,
-    ?, ?
+    ?, ?,
+    ?
 )
 """
 
@@ -170,14 +172,14 @@ def all_cursor_paths(conn: sqlite3.Connection) -> set[str]:
 
 def _record_to_tuple(r: InvocationRecord) -> tuple:
     return (
-        r.request_id, r.tool_use_id, r.session_id, r.session_file_path,
-        r.skill_name, r.cwd, r.model, r.service_tier,
+        r.invocation_type,
+        r.session_file_path, r.start_line_offset, r.end_line_offset, r.trigger_line_offset,
+        r.session_id, r.skill_name, r.cwd, r.model, r.service_tier,
         r.started_at, r.ended_at, r.duration_ms,
         r.input_tokens, r.output_tokens, r.cache_read_tokens, r.cache_creation_tokens,
         r.cache_5m_tokens, r.cache_1h_tokens,
-        r.result_size_bytes,
+        r.n_requests, r.first_request_id,
         int(r.success),
-        r.tool_use_line_offset, r.tool_result_line_offset,
     )
 
 
@@ -200,11 +202,11 @@ def _smoke(jsonl_path: str, db_path: str = "/tmp/csm-smoke.db") -> None:
 
         print("\nGROUP BY skill_name:")
         for row in conn.execute(
-            "SELECT skill_name, COUNT(*) AS n, "
+            "SELECT skill_name, invocation_type, COUNT(*) AS n, "
             "SUM(input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) AS tokens "
-            "FROM skill_invocations GROUP BY skill_name ORDER BY n DESC"
+            "FROM skill_invocations GROUP BY skill_name, invocation_type ORDER BY tokens DESC"
         ):
-            print(f"  {row['n']:>3}  {row['skill_name']:<25}  tokens={row['tokens']:>8}")
+            print(f"  {row['n']:>3}  {row['invocation_type']:<14} {row['skill_name']:<25}  tokens={row['tokens']:>10,}")
 
         print("\ncursor round-trip:")
         upsert_cursor(conn, "/tmp/fake.jsonl", mtime=12345, size=678, offset=678, inode=999)
