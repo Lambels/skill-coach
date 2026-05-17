@@ -14,19 +14,13 @@ Headline counts and token totals across all indexed skill invocations.
 
 Single-row aggregate over the entire index (or a date window). Tells you
 how big the dataset is and what time span it covers, without drilling
-into specific skills, sessions, or projects. Cheap — pure DB, no file IO.
+into specific skills, sessions, or projects.
 
-Use this when:
-    - You need to size up the dataset before drilling in further
-    - You want the date range currently covered by the index
-    - You want headline token totals across all skills
-
-Don't use this when:
-    - You want per-skill ranking → use top_skills
-    - You want per-session ranking → use by_session
-    - You want USD cost breakdown → use cost_per_skill
-    - You want a time-series view → use daily_trend
-    - You want detail for one specific skill → use skill_detail
+Questions this tool answers:
+    - How many skill invocations are indexed?
+    - What date range does the index currently cover?
+    - How many distinct skills / sessions / projects appear?
+    - What are the total input / output / cache_read / cache_creation tokens?
 
 Parameters:
     days (int, optional): Restrict to invocations in the last N days.
@@ -58,12 +52,6 @@ Example:
     # → {"data": {"invocations": 80, "distinct_skills": 15, ...},
     #    "meta": {"tool": "overview", "window": "last 30 days (...)", ...}}
 
-Related tools:
-    - top_skills: after sizing up, rank which skills dominate the cost
-    - cost_per_skill: translate token sums to USD per skill
-    - by_session: find the most expensive individual sessions
-    - daily_trend: see how token cost varies day-to-day
-
 Reads from: DB (no JSONL, no filesystem).
 Side effects: none (read-only).
 """
@@ -75,9 +63,6 @@ def overview(days: Optional[int] = None) -> dict:
 
     Args:
         days: optional window in days (None = all time)
-
-    Returns:
-        Wrapped envelope with the aggregate dict and standard meta.
     """
     with db.connect(get_db_path()) as conn:
         ov = queries.overview(conn, days=days)
