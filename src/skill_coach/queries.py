@@ -307,6 +307,64 @@ def cache_health(
     return [dict(r) for r in rows]
 
 
+def all_skills_full(
+    conn: sqlite3.Connection,
+    days: Optional[int] = None,
+    min_calls: int = 1,
+    name_filter: Optional[str] = None,
+    invocation_type: Optional[str] = None,
+) -> list[dict]:
+    """One row per skill with every aggregate column the `skills` CLI surfaces.
+
+    Cost is NOT included here — caller merges in pricing.cost_per_skill(),
+    since cost depends on per-row model rates that don't aggregate cleanly in SQL.
+    """
+    tf_sql, tf_params = time_filter(days)
+    extra_sql = ""
+    extra_params: tuple = ()
+    if name_filter:
+        extra_sql += " AND skill_name LIKE ?"
+        extra_params = (*extra_params, f"%{name_filter}%")
+    if invocation_type:
+        if invocation_type not in ("slash_command", "skill_tool"):
+            raise ValueError(
+                f"invalid invocation_type={invocation_type!r}; "
+                "expected 'slash_command' or 'skill_tool'"
+            )
+        extra_sql += " AND invocation_type = ?"
+        extra_params = (*extra_params, invocation_type)
+
+    rows = conn.execute(
+        f"""
+        SELECT
+            skill_name,
+            COUNT(*)                              AS calls,
+            SUM(input_tokens + output_tokens
+                + cache_read_tokens + cache_creation_tokens) AS total_tokens,
+            AVG(input_tokens + output_tokens
+                + cache_read_tokens + cache_creation_tokens) AS avg_tokens,
+            AVG(duration_ms)                      AS avg_duration_ms,
+            AVG(n_requests)                       AS avg_requests,
+            SUM(output_tokens)                    AS total_output,
+            SUM(input_tokens)                     AS total_uncached_input,
+            SUM(cache_read_tokens)                AS total_cache_read,
+            SUM(cache_creation_tokens)            AS total_cache_creation,
+            CAST(SUM(cache_read_tokens) AS REAL) / NULLIF(
+                SUM(cache_read_tokens + cache_creation_tokens + input_tokens), 0
+            )                                     AS cache_hit_ratio,
+            SUM(CASE WHEN invocation_type = 'slash_command' THEN 1 ELSE 0 END) AS slash_calls,
+            SUM(CASE WHEN invocation_type = 'skill_tool'    THEN 1 ELSE 0 END) AS tool_calls
+        FROM skill_invocations
+        WHERE 1=1 {tf_sql} {extra_sql}
+        GROUP BY skill_name
+        HAVING calls >= ?
+        ORDER BY total_tokens DESC
+        """,
+        (*tf_params, *extra_params, min_calls),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def top_invocations(
     conn: sqlite3.Connection,
     by: str = "tokens",
