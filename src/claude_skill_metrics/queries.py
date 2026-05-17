@@ -16,7 +16,7 @@ from . import stats
 
 def overview(conn: sqlite3.Connection, days: Optional[int] = None) -> dict:
     """Headline numbers across the whole index (optionally windowed)."""
-    tf_sql, tf_params = _time_filter(days)
+    tf_sql, tf_params = time_filter(days)
     row = conn.execute(
         f"""
         SELECT
@@ -56,7 +56,7 @@ def top_skills(
     if by not in order_by:
         raise ValueError(f"invalid by={by!r}; expected one of {list(order_by)}")
 
-    tf_sql, tf_params = _time_filter(days)
+    tf_sql, tf_params = time_filter(days)
     rows = conn.execute(
         f"""
         SELECT
@@ -90,7 +90,7 @@ def skill_detail(
     days: Optional[int] = None,
 ) -> Optional[dict]:
     """Full stats for one skill, including p50/p95 of duration and result size."""
-    tf_sql, tf_params = _time_filter(days)
+    tf_sql, tf_params = time_filter(days)
     params = (name, *tf_params)
 
     agg = conn.execute(
@@ -148,7 +148,7 @@ def skill_invocations(
     days: Optional[int] = None,
 ) -> list[dict]:
     """Raw list of individual invocations of one skill, newest first."""
-    tf_sql, tf_params = _time_filter(days)
+    tf_sql, tf_params = time_filter(days)
     rows = conn.execute(
         f"""
         SELECT
@@ -176,7 +176,7 @@ def daily_trend(
     """One row per day. Optionally filtered to a single skill."""
     skill_clause = "AND skill_name = ?" if skill_name else ""
     skill_params = (skill_name,) if skill_name else ()
-    tf_sql, tf_params = _time_filter(days)
+    tf_sql, tf_params = time_filter(days)
 
     rows = conn.execute(
         f"""
@@ -203,7 +203,7 @@ def by_session(
     days: Optional[int] = None,
 ) -> list[dict]:
     """Most expensive sessions by total token cost across all their skill calls."""
-    tf_sql, tf_params = _time_filter(days)
+    tf_sql, tf_params = time_filter(days)
     rows = conn.execute(
         f"""
         SELECT
@@ -230,7 +230,7 @@ def by_project(
     days: Optional[int] = None,
 ) -> list[dict]:
     """Per-(project, skill) breakdown."""
-    tf_sql, tf_params = _time_filter(days)
+    tf_sql, tf_params = time_filter(days)
     rows = conn.execute(
         f"""
         SELECT
@@ -254,7 +254,7 @@ def by_model(
     days: Optional[int] = None,
 ) -> list[dict]:
     """Per-model rollup."""
-    tf_sql, tf_params = _time_filter(days)
+    tf_sql, tf_params = time_filter(days)
     rows = conn.execute(
         f"""
         SELECT
@@ -281,7 +281,7 @@ def cache_health(
     days: Optional[int] = None,
 ) -> list[dict]:
     """Per-skill cache analysis. Lower cache_hit_ratio = more expensive."""
-    tf_sql, tf_params = _time_filter(days)
+    tf_sql, tf_params = time_filter(days)
     rows = conn.execute(
         f"""
         SELECT
@@ -323,7 +323,7 @@ def top_invocations(
     if by not in order_by:
         raise ValueError(f"invalid by={by!r}; expected one of {list(order_by)}")
 
-    tf_sql, tf_params = _time_filter(days)
+    tf_sql, tf_params = time_filter(days)
     rows = conn.execute(
         f"""
         SELECT
@@ -344,7 +344,7 @@ def top_invocations(
     return [dict(r) for r in rows]
 
 
-def _time_filter(days: Optional[int]) -> tuple[str, tuple]:
+def time_filter(days: Optional[int]) -> tuple[str, tuple]:
     if days is None:
         return "", ()
     cutoff_ms = int((time.time() - days * 86400) * 1000)

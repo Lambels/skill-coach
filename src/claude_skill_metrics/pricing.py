@@ -104,6 +104,29 @@ def known_models() -> list[str]:
     return sorted(MODEL_PRICING.keys())
 
 
+def cost_per_skill(conn, days: Optional[int] = None) -> list[dict]:
+    """Per-skill USD cost. Streams over skill_invocations, applies model rates."""
+    from . import queries
+    tf_sql, tf_params = queries.time_filter(days)
+    rows = conn.execute(
+        f"""
+        SELECT skill_name, model, input_tokens, output_tokens,
+               cache_read_tokens, cache_5m_tokens, cache_1h_tokens
+        FROM skill_invocations
+        WHERE 1=1 {tf_sql}
+        """,
+        tf_params,
+    ).fetchall()
+    totals: dict[str, dict] = {}
+    for row in rows:
+        d = dict(row)
+        skill = d["skill_name"]
+        slot = totals.setdefault(skill, {"skill_name": skill, "calls": 0, "cost_usd": 0.0})
+        slot["calls"] += 1
+        slot["cost_usd"] += cost_usd(d)
+    return sorted(totals.values(), key=lambda x: -x["cost_usd"])
+
+
 def _smoke(db_path: str = "/tmp/csm-smoke.db") -> None:
     from collections import defaultdict
     from . import db
