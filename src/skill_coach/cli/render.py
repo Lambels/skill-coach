@@ -74,6 +74,96 @@ def print_sections_as_json(sections: list[Section]) -> None:
     print(json.dumps(payload, indent=2, default=str))
 
 
+class ColumnFilterError(ValueError):
+    """User passed an unknown column name to --cols/--add/--drop."""
+
+
+def list_available_columns(sections: list[Section]) -> None:
+    """Print the available columns per table section, marking defaults."""
+    any_printed = False
+    for s in sections:
+        if s.kind != "table" or not s.columns:
+            continue
+        any_printed = True
+        defaults = set(s.default_columns or [])
+        stdout.print(f"[bold]{s.title}[/bold]")
+        for key, header, _, _, _ in s.columns:
+            in_default = (header in defaults) or (key in defaults)
+            marker = "[green]●[/green]" if in_default else "[dim]○[/dim]"
+            stdout.print(f"  {marker} [cyan]{header}[/cyan]  [dim](key: {key})[/dim]")
+        if defaults:
+            stdout.print(f"  [dim]● = shown by default, ○ = opt-in via --add[/dim]")
+    if not any_printed:
+        stderr.print("[yellow]This command produces no table sections.[/yellow]")
+
+
+def apply_column_filters(
+    sections: list[Section],
+    cols: Optional[str],
+    add: Optional[str],
+    drop: Optional[str],
+) -> list[Section]:
+    """Resolve each table section's visible columns.
+
+    Without --cols/--add/--drop, the section's `default_columns` (if set)
+    selects which of `columns` are shown; otherwise all `columns` show.
+    Selection is matched against either column header OR its data key.
+    Panel sections are passed through unchanged.
+    """
+    out = []
+    for s in sections:
+        if s.kind != "table" or not s.columns:
+            out.append(s)
+            continue
+        out.append(_filter_one_section(s, cols, add, drop))
+    return out
+
+
+def _filter_one_section(
+    s: Section,
+    cols: Optional[str],
+    add: Optional[str],
+    drop: Optional[str],
+) -> Section:
+    all_cols = list(s.columns)
+    by_header = {c[1]: c for c in all_cols}
+    by_key = {c[0]: c for c in all_cols if c[0]}
+
+    def resolve(name: str):
+        if name in by_header:
+            return by_header[name]
+        if name in by_key:
+            return by_key[name]
+        choices = ", ".join(c[1] for c in all_cols)
+        raise ColumnFilterError(
+            f"unknown column {name!r} in section {s.title!r}. "
+            f"available: {choices}"
+        )
+
+    def split(v: Optional[str]) -> list[str]:
+        return [x.strip() for x in v.split(",") if x.strip()] if v else []
+
+    if cols:
+        chosen = [resolve(n) for n in split(cols)]
+    else:
+        # Start from section's declared default (if any), else show every column.
+        if s.default_columns:
+            chosen = [resolve(n) for n in s.default_columns]
+        else:
+            chosen = list(all_cols)
+        for name in split(drop):
+            target = resolve(name)
+            chosen = [c for c in chosen if c is not target]
+        for name in split(add):
+            chosen.append(resolve(name))
+
+    return Section(
+        title=s.title, data=s.data, kind=s.kind,
+        columns=chosen,
+        default_columns=s.default_columns,
+    )
+
+
 def print_sweep_banner(r: SweepResult, quiet: bool) -> None:
     if quiet:
         return

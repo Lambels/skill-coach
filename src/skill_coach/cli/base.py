@@ -20,6 +20,7 @@ class Section:
     data: dict | list[dict] | str
     kind: SectionKind = "table"
     columns: Optional[list[ColumnSpec]] = None
+    default_columns: Optional[list[str]] = None  # subset of column headers/keys to show by default
 
 
 class Command(ABC):
@@ -30,6 +31,7 @@ class Command(ABC):
     aliases: list[str] = []
     abstract: bool = False
     needs_sweep: bool = True
+    produces_tables: bool = True
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)

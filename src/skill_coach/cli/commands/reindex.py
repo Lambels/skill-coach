@@ -8,6 +8,7 @@ class Reindex(Command):
     name = "reindex"
     help = "force a full sweep and print the result"
     needs_sweep = False
+    produces_tables = False
 
     def register(self, parser):
         pass

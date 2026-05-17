@@ -10,7 +10,15 @@ from .. import db
 from ..indexer import DEFAULT_DB_PATH, DEFAULT_PROJECTS_DIR, index_sweep
 from . import commands  # noqa: F401 — triggers auto-discovery
 from .base import Command
-from .render import print_sections_as_json, print_sweep_banner, render_sections, stderr
+from .render import (
+    ColumnFilterError,
+    apply_column_filters,
+    list_available_columns,
+    print_sections_as_json,
+    print_sweep_banner,
+    render_sections,
+    stderr,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -34,9 +42,28 @@ def build_parser() -> argparse.ArgumentParser:
         sp = sub.add_parser(name, help=cls.help, aliases=cls.aliases or [])
         instance = cls()
         instance.register(sp)
+        if cls.produces_tables:
+            _register_table_flags(sp)
         sp.set_defaults(_command_cls=cls)
 
     return p
+
+
+def _register_table_flags(sp: argparse.ArgumentParser) -> None:
+    g = sp.add_argument_group("table columns")
+    g.add_argument(
+        "--cols", default=None,
+        help="comma-separated column list to show (overrides defaults); "
+             "pass '?' to list available columns and exit",
+    )
+    g.add_argument(
+        "--add", default=None,
+        help="comma-separated columns to add to the default set",
+    )
+    g.add_argument(
+        "--drop", default=None,
+        help="comma-separated columns to remove from the default set",
+    )
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -55,6 +82,20 @@ def main(argv: Optional[list[str]] = None) -> int:
             sections = instance.run(args, conn)
     else:
         sections = instance.run(args, conn=None)
+
+    cols = getattr(args, "cols", None)
+    add = getattr(args, "add", None)
+    drop = getattr(args, "drop", None)
+
+    if cols in ("?", "help"):
+        list_available_columns(sections)
+        return 0
+
+    try:
+        sections = apply_column_filters(sections, cols, add, drop)
+    except ColumnFilterError as e:
+        stderr.print(f"[red]error:[/red] {e}")
+        return 2
 
     if args.json:
         print_sections_as_json(sections)
