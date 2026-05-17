@@ -65,10 +65,6 @@ class InvocationRecord:
     # outcome
     success: bool
 
-
-# ────────────────────────────── public API ──────────────────────────────
-
-
 def parse_session_file(path: str | Path) -> Iterator[InvocationRecord]:
     """Yield one InvocationRecord per completed skill-invocation span."""
     path = Path(path).expanduser()
@@ -84,10 +80,6 @@ def parse_session_file(path: str | Path) -> Iterator[InvocationRecord]:
         rec = _measure_span(raw_lines, inv, invocations, session_id, cwd, path)
         if rec is not None:
             yield rec
-
-
-# ────────────────────────────── pass 1: find triggers ──────────────────────────────
-
 
 def _find_triggers(raw_lines: list[tuple[int, dict]]) -> list[dict]:
     """Locate every Skill tool_use AND every slash tag in order."""
@@ -121,7 +113,7 @@ def _find_triggers(raw_lines: list[tuple[int, dict]]) -> list[dict]:
     return out
 
 
-# ────────────────────────────── pass 2: pair triggers with meta lines ──────────────────────────────
+
 
 
 def _pair_with_meta(
@@ -198,10 +190,6 @@ def _find_meta_for(
 
     return (None, None, None, False)
 
-
-# ────────────────────────────── pass 3: measure each span ──────────────────────────────
-
-
 def _measure_span(
     raw_lines: list[tuple[int, dict]],
     inv: dict,
@@ -240,9 +228,14 @@ def _measure_span(
 
     meta_idx = inv["meta_idx"]
 
-    # Span ends at min(next trigger after meta, next fresh user prompt after meta, EOF).
-    next_trigger_idx = min(
-        (o["idx"] for o in all_invocations if o["idx"] > meta_idx),
+    # Span ends at min(next meta after this one, next fresh user prompt, EOF).
+    # Stopping at the next meta (not the next trigger) means the trigger line
+    # itself is included in the outer skill's span — those tokens belong to the
+    # skill whose SKILL.md is the most-recent meta above. Dedup by requestId
+    # keeps multi-block responses from being double-counted.
+    next_meta_idx = min(
+        (o["meta_idx"] for o in all_invocations
+         if o.get("meta_idx") is not None and o["meta_idx"] > meta_idx),
         default=len(raw_lines),
     )
     next_fresh_idx = len(raw_lines)
@@ -251,7 +244,7 @@ def _measure_span(
             next_fresh_idx = j
             break
 
-    span_end_idx = min(next_trigger_idx, next_fresh_idx)
+    span_end_idx = min(next_meta_idx, next_fresh_idx)
 
     # In-flight at EOF (no boundary found) → orphan, skip.
     if span_end_idx == len(raw_lines):
@@ -345,10 +338,6 @@ def _is_fresh_user_prompt(msg: dict) -> bool:
         )
     return False
 
-
-# ────────────────────────────── stdlib helpers ──────────────────────────────
-
-
 def _read_lines_with_offsets(path: Path) -> list[tuple[int, dict]]:
     out: list[tuple[int, dict]] = []
     with open(path, "rb") as f:
@@ -381,9 +370,6 @@ def _iso_to_ms(s: Optional[str]) -> int:
         return int(dt.timestamp() * 1000)
     except (ValueError, TypeError):
         return 0
-
-
-# ────────────────────────────── smoke ──────────────────────────────
 
 
 def _smoke(path: str) -> None:
