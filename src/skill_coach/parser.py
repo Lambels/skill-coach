@@ -17,6 +17,7 @@ Records store only numbers + pointers; text content stays in the JSONL.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -64,6 +65,9 @@ class InvocationRecord:
 
     # outcome
     success: bool
+
+    # SKILL.md identity — SHA256(meta line text)[:16]. None on failed dispatches.
+    skill_md_hash: Optional[str]
 
 def parse_session_file(path: str | Path) -> Iterator[InvocationRecord]:
     """Yield one InvocationRecord per completed skill-invocation span."""
@@ -224,9 +228,11 @@ def _measure_span(
             n_requests=0,
             first_request_id=None,
             success=False,
+            skill_md_hash=None,
         )
 
     meta_idx = inv["meta_idx"]
+    skill_md_hash = _hash_md(_extract_meta_text(raw_lines[meta_idx][1]))
 
     # Span ends at min(next meta after this one, next fresh user prompt, EOF).
     # Stopping at the next meta (not the next trigger) means the trigger line
@@ -314,7 +320,48 @@ def _measure_span(
         n_requests=n_requests,
         first_request_id=first_req,
         success=True,
+        skill_md_hash=skill_md_hash,
     )
+
+
+def _extract_meta_text(meta_msg: dict) -> str:
+    """Concatenate every text block on the meta line. This is the SKILL.md as
+    the model saw it (including any Claude Code prefix like 'Base directory ...').
+    """
+    c = (meta_msg.get("message") or {}).get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        parts: list[str] = []
+        for b in c:
+            if isinstance(b, dict) and b.get("type") == "text":
+                parts.append(b.get("text") or "")
+        return "".join(parts)
+    return ""
+
+
+_ARGS_MARKER = "\n\nARGUMENTS:"
+
+
+def _strip_call_args(text: str) -> str:
+    """Strip the trailing per-call ARGUMENTS block that Claude Code appends
+    to the meta line.
+
+    Without this, every invocation hashes differently even when the SKILL.md
+    on disk hasn't changed — defeating the whole point of skill_md_hash.
+    Using rfind: same input → same output, so hash stability is preserved
+    even if a SKILL.md body itself contains the marker string.
+    """
+    idx = text.rfind(_ARGS_MARKER)
+    return text[:idx] if idx != -1 else text
+
+
+def _hash_md(text: str) -> str:
+    """16-hex-char SHA256 prefix of the SKILL.md text (args stripped).
+
+    64-bit collision space — ample for the ≪ 1000 distinct SKILL.md versions
+    we expect over the project's lifetime."""
+    return hashlib.sha256(_strip_call_args(text).encode("utf-8")).hexdigest()[:16]
 
 
 def _is_fresh_user_prompt(msg: dict) -> bool:

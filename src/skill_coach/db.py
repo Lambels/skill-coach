@@ -41,14 +41,17 @@ CREATE TABLE IF NOT EXISTS skill_invocations (
 
     success                 INTEGER NOT NULL DEFAULT 1,
 
+    skill_md_hash           TEXT,
+
     PRIMARY KEY (session_file_path, start_line_offset)
 ) WITHOUT ROWID;
 
-CREATE INDEX IF NOT EXISTS idx_skill ON skill_invocations(skill_name);
-CREATE INDEX IF NOT EXISTS idx_time  ON skill_invocations(started_at);
-CREATE INDEX IF NOT EXISTS idx_sess  ON skill_invocations(session_id);
-CREATE INDEX IF NOT EXISTS idx_cwd   ON skill_invocations(cwd);
-CREATE INDEX IF NOT EXISTS idx_type  ON skill_invocations(invocation_type);
+CREATE INDEX IF NOT EXISTS idx_skill   ON skill_invocations(skill_name);
+CREATE INDEX IF NOT EXISTS idx_time    ON skill_invocations(started_at);
+CREATE INDEX IF NOT EXISTS idx_sess    ON skill_invocations(session_id);
+CREATE INDEX IF NOT EXISTS idx_cwd     ON skill_invocations(cwd);
+CREATE INDEX IF NOT EXISTS idx_type    ON skill_invocations(invocation_type);
+CREATE INDEX IF NOT EXISTS idx_md_hash ON skill_invocations(skill_md_hash);
 
 CREATE TABLE IF NOT EXISTS index_cursor (
     session_file_path   TEXT PRIMARY KEY,
@@ -70,7 +73,8 @@ INSERT OR IGNORE INTO skill_invocations (
     input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
     cache_5m_tokens, cache_1h_tokens,
     n_requests, first_request_id,
-    success
+    success,
+    skill_md_hash
 ) VALUES (
     ?,
     ?, ?, ?, ?,
@@ -79,6 +83,7 @@ INSERT OR IGNORE INTO skill_invocations (
     ?, ?, ?, ?,
     ?, ?,
     ?, ?,
+    ?,
     ?
 )
 """
@@ -180,6 +185,7 @@ def _record_to_tuple(r: InvocationRecord) -> tuple:
         r.cache_5m_tokens, r.cache_1h_tokens,
         r.n_requests, r.first_request_id,
         int(r.success),
+        r.skill_md_hash,
     )
 
 

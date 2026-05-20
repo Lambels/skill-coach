@@ -162,7 +162,7 @@ def skill_invocations(
             started_at, duration_ms, n_requests,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
             (input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) AS total_tokens,
-            success, cwd, model,
+            success, cwd, model, skill_md_hash,
             trigger_line_offset, start_line_offset, end_line_offset
         FROM skill_invocations
         WHERE skill_name = ? {tf_sql}
@@ -452,7 +452,7 @@ def session_invocations(
             started_at, ended_at, duration_ms, n_requests,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
             (input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) AS total_tokens,
-            success, cwd, model,
+            success, cwd, model, skill_md_hash,
             trigger_line_offset, start_line_offset, end_line_offset
         FROM skill_invocations
         WHERE session_id = ?
@@ -476,7 +476,7 @@ def invocation_by_pointer(
             started_at, ended_at, duration_ms, n_requests,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
             (input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) AS total_tokens,
-            success, cwd, model, first_request_id, service_tier,
+            success, cwd, model, first_request_id, service_tier, skill_md_hash,
             trigger_line_offset, start_line_offset, end_line_offset
         FROM skill_invocations
         WHERE session_file_path = ? AND start_line_offset = ?

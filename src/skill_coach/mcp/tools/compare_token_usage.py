@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 from ... import db, queries
 from .. import app, get_db_path
 from ..result import wrap
@@ -31,10 +33,19 @@ Both rows are returned in full plus a `delta` block with absolute and
 percent change for every standard metric. Percent change is `None` when
 the baseline (A) is zero.
 
+The response also includes a `skill_md_comparison` block reporting
+whether the two invocations ran the same SKILL.md text (via
+`skill_md_hash` comparison). When hashes differ, token deltas reflect
+BOTH the SKILL.md change AND the call-context change — interpret with
+care. When skills differ entirely (different `skill_name`) the response
+sets `same_skill = False` and the agent should usually treat the
+comparison as exploratory only.
+
 Questions this tool answers:
     - How much did this invocation cost vs another invocation of the same skill?
     - Did the new SKILL.md version reduce tokens? (Compare an old + new run.)
     - Why is this run 4× more expensive — which metric drives it?
+    - Is the comparison apples-to-apples (same SKILL.md) or confounded?
 
 Parameters:
     a_session_file_path (str), a_start_line_offset (int): invocation A (baseline).
@@ -50,9 +61,15 @@ Returns:
             - a, b: raw values
             - abs: b - a
             - pct: (b - a) / a, or None if a == 0
+        - skill_md_comparison: dict with:
+            - same_skill: bool — are both rows for the same skill_name?
+            - same_md: bool|None — do their skill_md_hash values match?
+              None when either hash is missing (e.g. failed dispatch).
+            - a_hash, b_hash: the two hashes (or null)
+            - warning: short string set when same_md is False, otherwise null
 
     If either row is missing the tool still returns successfully with the
-    null in place; `delta` is omitted.
+    null in place; `delta` and `skill_md_comparison` are omitted.
 
 Example:
     compare_token_usage(
@@ -75,6 +92,39 @@ def _compute_delta(a: dict, b: dict) -> dict:
     return out
 
 
+def _compare_skill_md(a: dict, b: dict) -> dict:
+    same_skill = a.get("skill_name") == b.get("skill_name")
+    a_hash = a.get("skill_md_hash")
+    b_hash = b.get("skill_md_hash")
+    if a_hash is None or b_hash is None:
+        same_md: Optional[bool] = None
+        warning: Optional[str] = (
+            "one or both invocations missing skill_md_hash "
+            "(failed dispatch?); cannot verify SKILL.md identity"
+        )
+    else:
+        same_md = a_hash == b_hash
+        warning = (
+            "SKILL.md text differs between invocations — "
+            "token delta reflects BOTH skill content AND call context"
+            if not same_md
+            else None
+        )
+    if not same_skill:
+        warning = (
+            "different skill_name — comparison is exploratory only"
+            if warning is None
+            else warning + "; also different skill_name"
+        )
+    return {
+        "same_skill": same_skill,
+        "same_md": same_md,
+        "a_hash": a_hash,
+        "b_hash": b_hash,
+        "warning": warning,
+    }
+
+
 @app.tool(description=_DESCRIPTION)
 def compare_token_usage(
     a_session_file_path: str,
@@ -90,6 +140,7 @@ def compare_token_usage(
     data: dict = {"a": a, "b": b}
     if a and b:
         data["delta"] = _compute_delta(a, b)
+        data["skill_md_comparison"] = _compare_skill_md(a, b)
 
     return wrap(
         data,
