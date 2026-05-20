@@ -144,11 +144,17 @@ def skill_detail(
 def skill_invocations(
     conn: sqlite3.Connection,
     name: str,
-    limit: int = 50,
+    limit: Optional[int] = 50,
     days: Optional[int] = None,
 ) -> list[dict]:
-    """Raw list of individual invocations of one skill, newest first."""
+    """Raw list of individual invocations of one skill, newest first.
+
+    `limit=None` returns every matching row (used by analytical tools that
+    need the full population, e.g. outlier detection).
+    """
     tf_sql, tf_params = time_filter(days)
+    limit_sql = "LIMIT ?" if limit is not None else ""
+    limit_params: tuple = (limit,) if limit is not None else ()
     rows = conn.execute(
         f"""
         SELECT
@@ -161,9 +167,9 @@ def skill_invocations(
         FROM skill_invocations
         WHERE skill_name = ? {tf_sql}
         ORDER BY started_at DESC
-        LIMIT ?
+        {limit_sql}
         """,
-        (name, *tf_params, limit),
+        (name, *tf_params, *limit_params),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -400,6 +406,84 @@ def top_invocations(
         (*tf_params, limit),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+METRIC_EXPRS: dict[str, str] = {
+    "input_tokens":          "input_tokens",
+    "output_tokens":         "output_tokens",
+    "cache_read_tokens":     "cache_read_tokens",
+    "cache_creation_tokens": "cache_creation_tokens",
+    "total_tokens":          "(input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens)",
+    "duration_ms":           "duration_ms",
+    "n_requests":            "n_requests",
+}
+
+
+def metric_values(
+    conn: sqlite3.Connection,
+    skill_name: str,
+    metric: str,
+    days: Optional[int] = None,
+) -> list[float]:
+    """Raw per-invocation values for one metric on one skill. Used by analytical helpers."""
+    if metric not in METRIC_EXPRS:
+        raise ValueError(f"invalid metric={metric!r}; expected one of {list(METRIC_EXPRS)}")
+    tf_sql, tf_params = time_filter(days)
+    rows = conn.execute(
+        f"""
+        SELECT {METRIC_EXPRS[metric]} AS v
+        FROM skill_invocations
+        WHERE skill_name = ? {tf_sql}
+        """,
+        (skill_name, *tf_params),
+    ).fetchall()
+    return [float(r["v"]) for r in rows]
+
+
+def session_invocations(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> list[dict]:
+    """Every skill invocation in one session, oldest first."""
+    rows = conn.execute(
+        """
+        SELECT
+            invocation_type, skill_name, session_id, session_file_path,
+            started_at, ended_at, duration_ms, n_requests,
+            input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+            (input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) AS total_tokens,
+            success, cwd, model,
+            trigger_line_offset, start_line_offset, end_line_offset
+        FROM skill_invocations
+        WHERE session_id = ?
+        ORDER BY started_at ASC
+        """,
+        (session_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def invocation_by_pointer(
+    conn: sqlite3.Connection,
+    session_file_path: str,
+    start_line_offset: int,
+) -> Optional[dict]:
+    """Single invocation row, located by its natural composite key."""
+    row = conn.execute(
+        """
+        SELECT
+            invocation_type, skill_name, session_id, session_file_path,
+            started_at, ended_at, duration_ms, n_requests,
+            input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+            (input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) AS total_tokens,
+            success, cwd, model, first_request_id, service_tier,
+            trigger_line_offset, start_line_offset, end_line_offset
+        FROM skill_invocations
+        WHERE session_file_path = ? AND start_line_offset = ?
+        """,
+        (session_file_path, start_line_offset),
+    ).fetchone()
+    return dict(row) if row else None
 
 
 def time_filter(days: Optional[int]) -> tuple[str, tuple]:
