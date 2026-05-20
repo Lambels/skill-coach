@@ -80,6 +80,46 @@ this dominates the bill.
 - **Minimum n**: 5 invocations on each side; HIGH at 10+.
 - **Default predicted savings**: 30–50% of `body_token_delta` per call.
 
+### H2b — Conditional branches with branch-scoped templates
+
+- **Signal**: body contains ≥ 3 distinct conditional blocks (markdown
+  headers, `**Pattern X** → ...` markers, or "If A: ... else if B: ..."
+  structures), each carrying its own template or rule set. AND
+  `body_tokens > 1500`. AND not all branches typically fire on a given
+  call.
+- **Detect with**: `get_skill_md_at_invocation` then regex for branch
+  markers; sample a few invocations via `get_skill_chain` or
+  `skill_invocations` to confirm only a subset of branches actually
+  fires on a typical run.
+- **Diagnose**: every call pays the full body cost regardless of which
+  branches fire. The unused branch templates are dead weight on the
+  calls that don't hit them. Especially common on orchestrator skills
+  (daily briefings, dispatchers) that handle multiple finding types
+  with per-type formats.
+- **Safe edit**: extract each branch's content to a topic-specific
+  reference file (e.g. `references/template-A.md`,
+  `references/template-B.md`). Replace each inline block in SKILL.md
+  with a one-line pointer that names when to follow it ("When handling
+  a new X, see `references/template-A.md` for the format.").
+- **Why behavior-preserving**: same templates are reachable to the
+  model — Claude Code lazy-loads referenced files when the body points
+  at them. As long as the trigger language is descriptive enough for
+  the model to recognise the case, the content arrives identically,
+  just lazily.
+- **Verify after applying**: `compare_token_usage` on calls known to
+  fire different branch counts. The cache_creation drop should be
+  largest on calls that hit only 1 branch.
+- **Minimum n**: 5 invocations; HIGH at 10+ with at least 3 invocations
+  per branch sampled.
+- **Default predicted savings**: 30–50% of the extracted-branch tokens
+  on calls that take a subset of branches; near 0% on calls that fire
+  every branch.
+- **Risk**: if the pointer language is weak ("see references/X.md"
+  without context), the model may skip following it and emit a worse
+  output shape for that branch. Mitigation: the pointer must name the
+  condition AND the file (e.g. "When the finding is a contest, follow
+  `references/template-contest.md` exactly.").
+
 ### H6 — Re-reads a large file every call
 
 - **Signal**: SKILL.md body contains `Read(<path>)` or `cat <path>` where
