@@ -255,7 +255,7 @@ def _measure_span(
     )
     next_fresh_idx = len(raw_lines)
     for j in range(meta_idx + 1, len(raw_lines)):
-        if _is_fresh_user_prompt(raw_lines[j][1]):
+        if is_fresh_user_prompt(raw_lines[j][1]):
             next_fresh_idx = j
             break
 
@@ -386,12 +386,14 @@ def _args_size(text: str) -> int:
     return len(args.encode("utf-8")) if args is not None else 0
 
 
-def _is_fresh_user_prompt(msg: dict) -> bool:
+def is_fresh_user_prompt(msg: dict) -> bool:
     """A user-typed prompt that ENDS a span. Excludes:
        - meta lines (isMeta=true)
        - tool_result lines (list content with type=tool_result)
        - slash command tag lines (string content with <command-name>) — those
          are themselves triggers and ALREADY end the span via next-trigger logic.
+
+    Public — shared with mcp/jsonl_seek for chain-boundary detection.
     """
     if msg.get("type") != "user":
         return False

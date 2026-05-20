@@ -91,3 +91,43 @@ def read_args_at(
     """Just the ARGUMENTS tail from the meta line. None when absent."""
     pair = read_meta_at(session_file_path, start_line_offset)
     return pair[1] if pair else None
+
+
+def has_fresh_prompt_between(
+    session_file_path: str,
+    after_offset: int,
+    before_offset: int,
+) -> bool:
+    """Scan JSONL lines strictly between two byte offsets.
+
+    Returns True iff any line in the half-open range
+    `(after_offset, before_offset)` is a fresh user prompt per
+    `parser.is_fresh_user_prompt`. Used by `get_skill_chain` to decide
+    whether two consecutive invocations belong to the same chain (no
+    intervening user prompt) or to separate chains.
+
+    Reads sequentially from `after_offset + 1` and stops at the first
+    fresh prompt found, so cost is bounded by the gap size.
+    """
+    if before_offset <= after_offset:
+        return False
+    p = Path(session_file_path).expanduser()
+    if not p.exists():
+        return False
+    try:
+        with open(p, "rb") as f:
+            f.seek(after_offset)
+            f.readline()  # skip the trailing newline of the `after` line itself
+            while f.tell() < before_offset:
+                raw = f.readline()
+                if not raw:
+                    break
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(msg, dict) and _parser.is_fresh_user_prompt(msg):
+                    return True
+    except OSError:
+        return False
+    return False
