@@ -69,6 +69,12 @@ class InvocationRecord:
     # SKILL.md identity — SHA256(meta line text)[:16]. None on failed dispatches.
     skill_md_hash: Optional[str]
 
+    # UTF-8 byte length of the `\n\nARGUMENTS: ...` tail Claude Code appends
+    # to the meta line. 0 when no ARGUMENTS block. Cheap analytics signal
+    # (find_outliers on args_size, distribution etc.). Args text itself stays
+    # in the JSONL — fetched on demand by mcp/jsonl_seek.
+    args_size_bytes: int
+
 def parse_session_file(path: str | Path) -> Iterator[InvocationRecord]:
     """Yield one InvocationRecord per completed skill-invocation span."""
     path = Path(path).expanduser()
@@ -229,10 +235,13 @@ def _measure_span(
             first_request_id=None,
             success=False,
             skill_md_hash=None,
+            args_size_bytes=0,
         )
 
     meta_idx = inv["meta_idx"]
-    skill_md_hash = _hash_md(_extract_meta_text(raw_lines[meta_idx][1]))
+    meta_text = extract_meta_text(raw_lines[meta_idx][1])
+    skill_md_hash = _hash_md(meta_text)
+    args_size_bytes = _args_size(meta_text)
 
     # Span ends at min(next meta after this one, next fresh user prompt, EOF).
     # Stopping at the next meta (not the next trigger) means the trigger line
@@ -321,12 +330,19 @@ def _measure_span(
         first_request_id=first_req,
         success=True,
         skill_md_hash=skill_md_hash,
+        args_size_bytes=args_size_bytes,
     )
 
 
-def _extract_meta_text(meta_msg: dict) -> str:
-    """Concatenate every text block on the meta line. This is the SKILL.md as
-    the model saw it (including any Claude Code prefix like 'Base directory ...').
+ARGS_MARKER = "\n\nARGUMENTS:"
+
+
+def extract_meta_text(meta_msg: dict) -> str:
+    """Concatenate every text block on a meta-line message. This is the
+    SKILL.md as the model saw it, including any Claude Code prefix like
+    'Base directory ...' and the trailing ARGUMENTS block.
+
+    Public — shared with mcp/jsonl_seek for on-demand content extraction.
     """
     c = (meta_msg.get("message") or {}).get("content")
     if isinstance(c, str):
@@ -340,20 +356,19 @@ def _extract_meta_text(meta_msg: dict) -> str:
     return ""
 
 
-_ARGS_MARKER = "\n\nARGUMENTS:"
+def split_md_and_args(text: str) -> tuple[str, Optional[str]]:
+    """Separate the SKILL.md prefix from the trailing per-call ARGUMENTS tail.
 
+    Returns (md_text, args_text). args_text is None when no marker found.
+    rfind: same input → same output, so hash stability is preserved even if a
+    SKILL.md body itself contains the marker string.
 
-def _strip_call_args(text: str) -> str:
-    """Strip the trailing per-call ARGUMENTS block that Claude Code appends
-    to the meta line.
-
-    Without this, every invocation hashes differently even when the SKILL.md
-    on disk hasn't changed — defeating the whole point of skill_md_hash.
-    Using rfind: same input → same output, so hash stability is preserved
-    even if a SKILL.md body itself contains the marker string.
+    Public — shared with mcp/jsonl_seek.
     """
-    idx = text.rfind(_ARGS_MARKER)
-    return text[:idx] if idx != -1 else text
+    idx = text.rfind(ARGS_MARKER)
+    if idx == -1:
+        return text, None
+    return text[:idx], text[idx + len(ARGS_MARKER):]
 
 
 def _hash_md(text: str) -> str:
@@ -361,7 +376,14 @@ def _hash_md(text: str) -> str:
 
     64-bit collision space — ample for the ≪ 1000 distinct SKILL.md versions
     we expect over the project's lifetime."""
-    return hashlib.sha256(_strip_call_args(text).encode("utf-8")).hexdigest()[:16]
+    md, _ = split_md_and_args(text)
+    return hashlib.sha256(md.encode("utf-8")).hexdigest()[:16]
+
+
+def _args_size(text: str) -> int:
+    """UTF-8 byte length of the ARGUMENTS tail. 0 when no marker found."""
+    _, args = split_md_and_args(text)
+    return len(args.encode("utf-8")) if args is not None else 0
 
 
 def _is_fresh_user_prompt(msg: dict) -> bool:

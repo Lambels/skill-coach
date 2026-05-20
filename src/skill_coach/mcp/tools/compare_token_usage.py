@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Optional
 
 from ... import db, queries
-from .. import app, get_db_path
+from .. import app, get_db_path, jsonl_seek
 from ..result import wrap
 
 
@@ -41,6 +41,15 @@ care. When skills differ entirely (different `skill_name`) the response
 sets `same_skill = False` and the agent should usually treat the
 comparison as exploratory only.
 
+The response also includes an `args_comparison` block carrying both
+invocations' raw ARGUMENTS text (fetched on demand from the JSONL via
+the recorded line offsets, not stored in the index). The agent is
+expected to read both strings and decide whether the difference is
+material — `vault-find-related "topic A"` vs `vault-find-related "topic
+B"` is technically different args but semantically the same workload;
+`/capture "short"` vs `/capture "long detailed thought"` is the
+opposite. No automatic verdict — agent judgment only.
+
 Questions this tool answers:
     - How much did this invocation cost vs another invocation of the same skill?
     - Did the new SKILL.md version reduce tokens? (Compare an old + new run.)
@@ -67,18 +76,24 @@ Returns:
               None when either hash is missing (e.g. failed dispatch).
             - a_hash, b_hash: the two hashes (or null)
             - warning: short string set when same_md is False, otherwise null
+        - args_comparison: dict with:
+            - a_text, b_text: raw ARGUMENTS strings (or null when no
+              ARGUMENTS block / JSONL unreadable)
+            - a_size, b_size: byte sizes from the index
+            - size_delta: b_size - a_size
 
     If either row is missing the tool still returns successfully with the
-    null in place; `delta` and `skill_md_comparison` are omitted.
+    null in place; `delta`, `skill_md_comparison`, and `args_comparison`
+    are omitted.
+
+Reads from: DB + JSONL (seek-by-offset to fetch ARGUMENTS text).
+Side effects: none (read-only).
 
 Example:
     compare_token_usage(
         a_session_file_path="/Users/.../session-abc.jsonl", a_start_line_offset=350,
         b_session_file_path="/Users/.../session-abc.jsonl", b_start_line_offset=385,
     )
-
-Reads from: DB (no JSONL, no filesystem).
-Side effects: none (read-only).
 """
 
 
@@ -90,6 +105,20 @@ def _compute_delta(a: dict, b: dict) -> dict:
         pct = ((bv - av) / av) if av else None
         out[m] = {"a": av, "b": bv, "abs": bv - av, "pct": pct}
     return out
+
+
+def _compare_args(a: dict, b: dict) -> dict:
+    a_text = jsonl_seek.read_args_at(a["session_file_path"], a["start_line_offset"])
+    b_text = jsonl_seek.read_args_at(b["session_file_path"], b["start_line_offset"])
+    a_size = a.get("args_size_bytes", 0) or 0
+    b_size = b.get("args_size_bytes", 0) or 0
+    return {
+        "a_text": a_text,
+        "b_text": b_text,
+        "a_size": a_size,
+        "b_size": b_size,
+        "size_delta": b_size - a_size,
+    }
 
 
 def _compare_skill_md(a: dict, b: dict) -> dict:
@@ -141,6 +170,7 @@ def compare_token_usage(
     if a and b:
         data["delta"] = _compute_delta(a, b)
         data["skill_md_comparison"] = _compare_skill_md(a, b)
+        data["args_comparison"] = _compare_args(a, b)
 
     return wrap(
         data,

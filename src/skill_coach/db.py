@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS skill_invocations (
     success                 INTEGER NOT NULL DEFAULT 1,
 
     skill_md_hash           TEXT,
+    args_size_bytes         INTEGER NOT NULL DEFAULT 0,
 
     PRIMARY KEY (session_file_path, start_line_offset)
 ) WITHOUT ROWID;
@@ -74,7 +75,7 @@ INSERT OR IGNORE INTO skill_invocations (
     cache_5m_tokens, cache_1h_tokens,
     n_requests, first_request_id,
     success,
-    skill_md_hash
+    skill_md_hash, args_size_bytes
 ) VALUES (
     ?,
     ?, ?, ?, ?,
@@ -84,7 +85,7 @@ INSERT OR IGNORE INTO skill_invocations (
     ?, ?,
     ?, ?,
     ?,
-    ?
+    ?, ?
 )
 """
 
@@ -185,7 +186,7 @@ def _record_to_tuple(r: InvocationRecord) -> tuple:
         r.cache_5m_tokens, r.cache_1h_tokens,
         r.n_requests, r.first_request_id,
         int(r.success),
-        r.skill_md_hash,
+        r.skill_md_hash, r.args_size_bytes,
     )
 
 
